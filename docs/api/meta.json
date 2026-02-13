@@ -1,0 +1,14 @@
+{
+  "generatedAt": "2026-09-07T12:14:39.751Z",
+  "courseCount": 1752,
+  "variableUnitCourses": 96,
+  "semester": "",
+  "source": "my.edu.sharif.edu websocket listUpdate",
+  "note": "capacity is a snapshot taken at generation time and goes stale quickly",
+  "fields": {
+    "u": "units",
+    "v": "isVariable",
+    "t": "title",
+    "c": "capacity at dump time"
+  }
+}
