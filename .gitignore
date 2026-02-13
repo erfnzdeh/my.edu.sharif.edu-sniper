@@ -1,0 +1,9 @@
+# build output
+/EduReq
+/my.edu.sharif.edu-sniper
+*.exe
+
+# local secrets / scratch
+*.local
+.env
+.DS_Store
