@@ -209,9 +209,14 @@ The sniper looks for the catalogue in this order:
 2. `docs/api/courses.json` next to the source or the binary
 3. the published URL in `catalogueURL`
 
-The local copy means it works with no network at all. Serving it over HTTP
-from GitHub Pages needs the repository to be public, or a plan that supports
-Pages on private repositories.
+The local copy means it works with no network at all. The published copy is
+live at
+[erfnzdeh.github.io/my.edu.sharif.edu-sniper](https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/),
+served from `main` under `/docs`, so a clone is not required to read it:
+
+```
+curl https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/api/courses.json
+```
 
 ---
 
