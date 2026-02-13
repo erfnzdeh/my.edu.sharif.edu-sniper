@@ -17,8 +17,14 @@ with [the server contract](docs/reference/server-contract.md).
 ## Quick start
 
 ```
-go build -o sniper .
+go build -o sniper ./cmd/sniper
 ./sniper
+```
+
+Or straight from the module, no clone needed:
+
+```
+go install github.com/erfnzdeh/my.edu.sharif.edu-sniper/cmd/sniper@latest
 ```
 
 It will ask for your token and your courses. To skip the prompts:
@@ -45,7 +51,7 @@ flowchart LR
     end
     JSON --> SNIPE
     subgraph DAY["Registration day"]
-        SNIPE["sniper<br/>single file, standard library only"]
+        SNIPE["cmd/sniper<br/>single file, standard library only"]
         SNIPE -->|"POST /api/reg<br/>one request per 1.1s"| API["my.edu.sharif.edu"]
     end
 ```
