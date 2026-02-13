@@ -1,3 +1,5 @@
+![The Sharif course registration portal, showing the offered course list with capacity, group and unit columns](docs/header.png)
+
 # my.edu.sharif.edu-sniper
 
 Registers courses on the Sharif University student portal the moment your
@@ -171,13 +173,6 @@ and one was zero, so a hardcoded `3` would have failed half the list with
 
 The catalogue also means a wrong course code is caught while you are typing it
 rather than at the window.
-
-## Decision 5: the script is an assistant, not a replacement
-
-Keep the portal open in a browser and be ready to register by hand. The script
-can lose a race, hit a block page, or run on a dead token. Every attempt is
-logged with a timestamp, an attempt counter and the exact retry time, and a
-terminal bell rings each time a course lands.
 
 ---
 
