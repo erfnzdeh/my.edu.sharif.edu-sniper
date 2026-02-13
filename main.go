@@ -2,12 +2,10 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -19,6 +17,8 @@ type VahedRequest struct {
 }
 
 type VahedResponse struct {
+	Error             string              `json:"error"`
+	RemainingActions  int                 `json:"remainingActions"`
 	Jobs              []*VahedJobResponse `json:"jobs"`
 	RegisterationTime int64               `json:"registrationTime"`
 	Time              int64               `json:"time"`
@@ -29,12 +29,28 @@ type VahedJobResponse struct {
 	Result string `json:"result"`
 }
 
+// jobResult carries one course outcome back to main, so the shared course
+// list is only ever mutated from a single goroutine.
+type jobResult struct {
+	course      string
+	registered  bool
+	rateLimited bool
+}
+
 const EduUrl = "https://my.edu.sharif.edu/api/reg"
 const AuthToken = "" // take from headers after login.
 
-var mu sync.Mutex
+// Result codes returned by the portal. Verified against the frontend bundle.
+const (
+	ResultOK              = "OK"
+	ResultDuplicate       = "COURSE_DUPLICATE"
+	ResultInvalidCourse   = "INVALID_COURSE"
+	ResultRepeatedRequest = "REPEATED_REQUEST"
+	ErrAuthorization      = "AUTHORIZATION"
+)
+
 var wg sync.WaitGroup
-var waitCount int64
+var mu sync.Mutex
 var vaheds = []*VahedRequest{
 	{
 		Action: "add",
@@ -49,7 +65,7 @@ var vaheds = []*VahedRequest{
 } // fill with your courses in the above format.
 
 func main() {
-	client := &http.Client{}
+	client := &http.Client{Timeout: 10 * time.Second}
 	delay, err := findTimeDiff(client)
 	if err != nil {
 		fmt.Println(err)
@@ -58,18 +74,32 @@ func main() {
 	if delay > 0 {
 		time.Sleep(delay)
 	}
-	waitCount = 5
-	for {
+	for len(vaheds) > 0 {
+		results := make(chan jobResult, len(vaheds))
+		for _, vahed := range vaheds {
+			wg.Add(1)
+			go reqToEdu(client, vahed, results)
+		}
+		wg.Wait()
+		close(results)
+
+		waitCount := 5 * time.Second
+		for r := range results {
+			if r.rateLimited {
+				waitCount = 7 * time.Second
+			}
+			if r.registered {
+				for j := len(vaheds) - 1; j >= 0; j-- {
+					if vaheds[j].Course == r.course {
+						vaheds = append(vaheds[:j], vaheds[j+1:]...)
+					}
+				}
+			}
+		}
 		if len(vaheds) == 0 {
 			break
 		}
-		for _, vahed := range vaheds {
-			wg.Add(1)
-			go reqToEdu(client, vahed)
-		}
-		wg.Wait()
-		time.Sleep(time.Duration(waitCount) * time.Second)
-		waitCount = 5
+		time.Sleep(waitCount)
 	}
 }
 
@@ -98,37 +128,46 @@ func findTimeDiff(client *http.Client) (time.Duration, error) {
 	return delay, nil
 }
 
-func reqToEdu(client *http.Client, request *VahedRequest) {
+func reqToEdu(client *http.Client, request *VahedRequest, results chan<- jobResult) {
 	defer wg.Done()
+	out := jobResult{course: request.Course}
 	req := initRequest(request)
+
 	mu.Lock() // remove if requests are slowed by the server. (currently it is.)
 	res, err := client.Do(req)
+	mu.Unlock() // must not be deferred past this point, but must always run.
+
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println(request.Course, err)
+		results <- out
 		return
 	}
-	mu.Unlock()
 	resp, err := parseResponse(res)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println(request.Course, err)
+		if err.Error() == "TOO_MANY_REQUESTS" {
+			out.rateLimited = true
+		}
+		results <- out
 		return
 	}
-	if len(resp.Jobs) > 0 {
-		for i := len(resp.Jobs) - 1; i >= 0; i-- {
-			job := resp.Jobs[i]
-			if job.ID == request.Course {
-				fmt.Println(job.ID, job.Result)
-				if job.Result == "OK" || job.Result == "COURSE_DUPLICATE" {
-					for j := len(vaheds) - 1; j >= 0; j-- {
-						if vaheds[j].Course == job.ID {
-							vaheds = append(vaheds[:j], vaheds[j+1:]...)
-						}
-					}
-				}
-				break
-			}
+	// jobs is newest first and accumulates across requests, so scan forward
+	// and stop at the first entry for this course to read its latest result.
+	for _, job := range resp.Jobs {
+		if job.ID != request.Course {
+			continue
 		}
+		if job.Result == "" {
+			fmt.Println(job.ID, "QUEUED")
+			break
+		}
+		fmt.Println(job.ID, job.Result)
+		if job.Result == ResultOK || job.Result == ResultDuplicate {
+			out.registered = true
+		}
+		break
 	}
+	results <- out
 }
 
 func initRequest(request *VahedRequest) *http.Request {
@@ -136,57 +175,44 @@ func initRequest(request *VahedRequest) *http.Request {
 	json.NewEncoder(payloadBuf).Encode(request)
 	req, _ := http.NewRequest("POST", EduUrl, payloadBuf)
 	req.Header.Set("Authorization", AuthToken)
-	req.Header.Set("Host", "my.edu.sharif.edu")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:104.0) Gecko/20100101 Firefox/104.0") // change to your own browser agent if you like.
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Referer", "https://my.edu.sharif.edu/courses/offered")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://my.edu.sharif.edu")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("TE", "trailers")
+	req.Header.Set("Referer", "https://my.edu.sharif.edu/courses/offered")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:104.0) Gecko/20100101 Firefox/104.0") // change to your own browser agent if you like.
 	return req
 }
 
 func parseResponse(res *http.Response) (*VahedResponse, error) {
-	var Resp VahedResponse
-	responseBuf := new(bytes.Buffer)
-	if res.Header.Get("Content-Encoding") == "gzip" {
-		reader, err := gzip.NewReader(res.Body)
-		if err != nil {
-			return nil, err
-		}
-		defer reader.Close()
-		io.Copy(responseBuf, reader)
-	} else {
-		io.Copy(responseBuf, res.Body)
-	}
 	defer res.Body.Close()
-	out := responseBuf.String()
-	if out[0] == '<' {
-		waitCount = 7
+
+	// The edge rate limiter answers with a real 429 and an HTML body.
+	if res.StatusCode == http.StatusTooManyRequests {
 		return nil, fmt.Errorf("TOO_MANY_REQUESTS")
 	}
-	err := json.Unmarshal(responseBuf.Bytes(), &Resp)
-	if err != nil {
-		if strings.Contains(responseBuf.String(), "REPEATED_REQUEST") {
-			waitCount = 7
-			return nil, fmt.Errorf("REPEATED_REQUEST")
-		}
-		if strings.Contains(responseBuf.String(), "MAAREF_COURSES_LIMIT") {
-			return nil, fmt.Errorf("MAAREF_COURSES_LIMIT")
-		}
-		if strings.Contains(responseBuf.String(), "CAPACITY_EXCEEDED") {
-			return nil, fmt.Errorf("CAPACITY_EXCEEDED")
-		}
-		if strings.Contains(responseBuf.String(), "COURSE_NOT_FOUND") {
-			return nil, fmt.Errorf("COURSE_NOT_FOUND")
-		}
+
+	responseBuf := new(bytes.Buffer)
+	if _, err := io.Copy(responseBuf, res.Body); err != nil {
 		return nil, err
 	}
-	return &Resp, nil
+	body := responseBuf.Bytes()
+	if len(body) == 0 {
+		return nil, fmt.Errorf("empty response body (status %d)", res.StatusCode)
+	}
+	if body[0] != '{' {
+		return nil, fmt.Errorf("non-JSON response (status %d): %.60s", res.StatusCode, body)
+	}
+
+	var resp VahedResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	// Auth failures arrive as HTTP 200 with an error field, never as a 401.
+	if resp.Error != "" {
+		if resp.Error == ErrAuthorization {
+			return nil, fmt.Errorf("AUTHORIZATION: token rejected or expired, log in again")
+		}
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+	return &resp, nil
 }
