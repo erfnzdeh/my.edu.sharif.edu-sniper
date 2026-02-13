@@ -28,9 +28,9 @@ import (
 
 // Measured against the live API. See README for how these were established.
 const (
-	eduURL     = "https://my.edu.sharif.edu/api/reg"
-	eduOrigin  = "https://my.edu.sharif.edu"
-	eduReferer = "https://my.edu.sharif.edu/courses/offered"
+	regEndpoint   = "https://my.edu.sharif.edu/api/reg"
+	portalOrigin  = "https://my.edu.sharif.edu"
+	portalReferer = "https://my.edu.sharif.edu/courses/offered"
 
 	// The edge limiter permits one request per second and rejects anything
 	// faster outright, so leave a little headroom on the boundary.
@@ -55,15 +55,15 @@ const (
 
 // Result codes, taken from the portal frontend bundle.
 const (
-	resultOK         = "OK"
-	resultDuplicate  = "COURSE_DUPLICATE"
-	errAuthorization = "AUTHORIZATION"
+	resultOK        = "OK"
+	resultDuplicate = "COURSE_DUPLICATE"
+	resultAuthError = "AUTHORIZATION"
 )
 
-// permanent lists the results that can never succeed on a retry. Courses are
+// permanentFailures lists the results that can never succeed on a retry. Courses are
 // still retried, because the operator watches the log and decides, but these
 // are called out loudly so a typo or a clash is obvious at a glance.
-var permanent = map[string]string{
+var permanentFailures = map[string]string{
 	"INVALID_COURSE":          "no such course, check the code and group",
 	"INCORRECT_UNIT_NUMBER":   "wrong unit count for this course",
 	"UNITS_LIMIT":             "this would exceed your total unit limit",
@@ -78,12 +78,17 @@ var permanent = map[string]string{
 	"NO_PERMISSION":           "no permission to register for this course",
 }
 
-type catEntry struct {
-	U int32  `json:"u"`
-	V int    `json:"v"`
-	T string `json:"t"`
-	C int    `json:"c"`
+type catalogueEntry struct {
+	Units    int32  `json:"u"`
+	Variable int    `json:"v"` // 1 when the student picks the unit count
+	Title    string `json:"t"`
+	Capacity int    `json:"c"` // snapshot at dump time, goes stale quickly
 }
+
+// variableUnits reports whether the unit count can be chosen. The wire format
+// carries 0 and 1 rather than a JSON boolean, and released binaries already
+// parse it as a number, so the field stays an int and this hides that.
+func (e catalogueEntry) variableUnits() bool { return e.Variable != 0 }
 
 type regRequest struct {
 	Action string `json:"action"`
@@ -170,22 +175,22 @@ func run() int {
 	// The clock probe doubles as the token check. Spend it on the lowest
 	// priority course, whose cooldown expires long before the window.
 	probe := courses[len(courses)-1]
-	sync, err := cl.syncClock(probe)
+	clk, err := cl.syncClock(probe)
 	if err != nil {
 		ui.fatal("%v", err)
 		return 2
 	}
-	ui.showMath(sync)
+	ui.showClockSync(clk)
 
-	target, err := resolveWindow(ui, sync, *fAt, *fYes)
+	target, err := resolveWindow(ui, clk, *fAt, *fYes)
 	if err != nil {
 		ui.fatal("%v", err)
 		return 2
 	}
 
-	fireAt := sync.fireTime(target)
-	ui.showFormula(sync, target, fireAt)
-	if !confirm(ui, courses, sync, target, fireAt, *fYes) {
+	fireAt := clk.fireTime(target)
+	ui.showFireTime(clk, target, fireAt)
+	if !confirm(ui, courses, clk, target, fireAt, *fYes) {
 		ui.info("cancelled")
 		return 2
 	}
@@ -199,7 +204,7 @@ func run() int {
 	}
 
 	cl.warmUp(ui, fireAt)
-	authFailed := burst(ctx, ui, cl, courses)
+	authFailed := fireWindow(ctx, ui, cl, courses)
 	code := report(ui, courses)
 	if authFailed {
 		return 2
@@ -209,10 +214,10 @@ func run() int {
 
 // ---------------------------------------------------------------- scheduling
 
-// burst spends one request token at a time on the highest priority course
+// fireWindow spends one request token at a time on the highest priority course
 // that is off cooldown, until every course has landed or the run is stopped.
-// burst returns true when it stopped because the token was rejected.
-func burst(ctx context.Context, ui *ui, cl *client, courses []*course) bool {
+// fireWindow returns true when it stopped because the token was rejected.
+func fireWindow(ctx context.Context, ui *ui, cl *client, courses []*course) bool {
 	ui.rule("window open, firing")
 	nextGlobal := time.Now()
 
@@ -301,7 +306,7 @@ func applyJobs(ui *ui, courses []*course, pick *course, resp *regResponse, rtt t
 	default:
 		pick.last = res
 		note := fmt.Sprintf("retry at %s", pick.next.Format("15:04:05.000"))
-		if why, bad := permanent[res]; bad {
+		if why, bad := permanentFailures[res]; bad {
 			note = why + ", will not succeed on retry"
 		}
 		ui.attempt(pick, res, note, rtt, kindBad)
@@ -398,15 +403,15 @@ func (c *client) post(body regRequest) (*regResponse, time.Duration, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	req, err := http.NewRequest(http.MethodPost, eduURL, bytes.NewReader(buf))
+	req, err := http.NewRequest(http.MethodPost, regEndpoint, bytes.NewReader(buf))
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", c.token)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", eduOrigin)
-	req.Header.Set("Referer", eduReferer)
+	req.Header.Set("Origin", portalOrigin)
+	req.Header.Set("Referer", portalReferer)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
 	reused := false
@@ -445,7 +450,7 @@ func (c *client) post(body regRequest) (*regResponse, time.Duration, error) {
 		return nil, rtt, err
 	}
 	// Auth failure arrives as HTTP 200 with an error field, never a 401.
-	if out.Error == errAuthorization {
+	if out.Error == resultAuthError {
 		return nil, rtt, errAuth
 	}
 	if out.Error != "" {
@@ -466,7 +471,7 @@ func (c *client) warmUp(ui *ui, fireAt time.Time) {
 	if lead > 0 {
 		time.Sleep(lead)
 	}
-	req, err := http.NewRequest(http.MethodGet, eduOrigin+"/", nil)
+	req, err := http.NewRequest(http.MethodGet, portalOrigin+"/", nil)
 	if err != nil {
 		return
 	}
@@ -486,13 +491,13 @@ func (c *client) warmUp(ui *ui, fireAt time.Time) {
 // ---------------------------------------------------------------- clock sync
 
 type clockSync struct {
-	sent      time.Time
-	recv      time.Time
-	rtt       time.Duration
-	server    time.Time
-	registrat time.Time
-	stale     bool
-	remaining int
+	sent         time.Time
+	recv         time.Time
+	rtt          time.Duration
+	server       time.Time
+	registration time.Time
+	stale        bool
+	remaining    int
 }
 
 func (c *client) syncClock(co *course) (*clockSync, error) {
@@ -509,14 +514,14 @@ func (c *client) syncClock(co *course) (*clockSync, error) {
 		return nil, fmt.Errorf("clock probe failed: %w", err)
 	}
 	s := &clockSync{
-		sent:      sent,
-		recv:      recv,
-		rtt:       rtt,
-		server:    msToTime(resp.Time),
-		registrat: msToTime(resp.RegistrationTime),
-		remaining: resp.RemainingActions,
+		sent:         sent,
+		recv:         recv,
+		rtt:          rtt,
+		server:       msToTime(resp.Time),
+		registration: msToTime(resp.RegistrationTime),
+		remaining:    resp.RemainingActions,
 	}
-	s.stale = s.server.After(s.registrat.Add(time.Hour))
+	s.stale = s.server.After(s.registration.Add(time.Hour))
 	return s, nil
 }
 
@@ -544,13 +549,13 @@ func resolveWindow(ui *ui, s *clockSync, at string, yes bool) (time.Time, error)
 		return t, nil
 	}
 	if !s.stale {
-		ui.info("window     %s (from the server)", s.registrat.Format("2006-01-02 15:04:05"))
-		return s.registrat, nil
+		ui.info("window     %s (from the server)", s.registration.Format("2006-01-02 15:04:05"))
+		return s.registration, nil
 	}
 
 	ui.warn("the server's registrationTime is %s, which passed %s ago.",
-		s.registrat.Format("2006-01-02 15:04:05"),
-		s.server.Sub(s.registrat).Truncate(time.Minute))
+		s.registration.Format("2006-01-02 15:04:05"),
+		s.server.Sub(s.registration).Truncate(time.Minute))
 	if yes {
 		return time.Time{}, errors.New("window is ambiguous and -y was given, pass -at HH:MM to say which window you mean")
 	}
@@ -597,7 +602,7 @@ func parseAt(at string, server time.Time) (time.Time, error) {
 // loadCatalogue resolves courses.json from the explicit override, then the
 // copy committed alongside the source, then the published static API. The
 // local copy means the tool works with no network at all.
-func loadCatalogue(override string) (map[string]catEntry, string, error) {
+func loadCatalogue(override string) (map[string]catalogueEntry, string, error) {
 	var candidates []string
 	if override != "" {
 		candidates = []string{override}
@@ -613,7 +618,7 @@ func loadCatalogue(override string) (map[string]catEntry, string, error) {
 			last = err
 			continue
 		}
-		var cat map[string]catEntry
+		var cat map[string]catalogueEntry
 		if err := json.Unmarshal(raw, &cat); err != nil {
 			last = fmt.Errorf("%s: %w", src, err)
 			continue
@@ -661,14 +666,14 @@ func readSource(src string) ([]byte, error) {
 func resolveToken(ui *ui, flagVal string, yes bool) (string, error) {
 	tok := cleanToken(flagVal)
 	if tok == "" {
-		tok = cleanToken(os.Getenv("EDU_TOKEN"))
+		tok = cleanToken(os.Getenv("MYEDU_TOKEN"))
 	}
 	if tok != "" {
 		ui.info("token      %s (%s)", mask(tok), plural(len(tok), "char"))
 		return tok, nil
 	}
 	if yes {
-		return "", errors.New("-y needs a token, pass -token or set EDU_TOKEN")
+		return "", errors.New("-y needs a token, pass -token or set MYEDU_TOKEN")
 	}
 	ui.rule("token")
 	ui.plain("  Log in at https://my.edu.sharif.edu, open the network tab, and copy")
@@ -700,7 +705,7 @@ func mask(s string) string {
 	return s[:8] + "..." + s[len(s)-4:]
 }
 
-func resolveCourses(ui *ui, cat map[string]catEntry, spec string, yes bool) ([]*course, error) {
+func resolveCourses(ui *ui, cat map[string]catalogueEntry, spec string, yes bool) ([]*course, error) {
 	if spec != "" {
 		return parseCourses(cat, strings.Split(spec, ","))
 	}
@@ -725,7 +730,7 @@ func resolveCourses(ui *ui, cat map[string]catEntry, spec string, yes bool) ([]*
 				continue
 			}
 			c := one[0]
-			ui.good("      %s  %s  %s, capacity %d", c.id, c.title, plural(int(c.units), "unit"), cat[c.id].C)
+			ui.good("      %s  %s  %s, capacity %d", c.id, c.title, plural(int(c.units), "unit"), cat[c.id].Capacity)
 			raw = append(raw, line)
 		}
 		if len(raw) == 0 {
@@ -736,7 +741,7 @@ func resolveCourses(ui *ui, cat map[string]catEntry, spec string, yes bool) ([]*
 	}
 }
 
-func parseCourses(cat map[string]catEntry, specs []string) ([]*course, error) {
+func parseCourses(cat map[string]catalogueEntry, specs []string) ([]*course, error) {
 	var out []*course
 	seen := map[string]bool{}
 	for _, s := range specs {
@@ -763,17 +768,17 @@ func parseCourses(cat map[string]catEntry, specs []string) ([]*course, error) {
 		}
 		seen[id] = true
 
-		units := entry.U
+		units := entry.Units
 		if override >= 0 {
-			if entry.V == 0 && override != entry.U {
-				return nil, fmt.Errorf("%s takes exactly %s and is not variable", id, plural(int(entry.U), "unit"))
+			if !entry.variableUnits() && override != entry.Units {
+				return nil, fmt.Errorf("%s takes exactly %s and is not variable", id, plural(int(entry.Units), "unit"))
 			}
-			if override > entry.U {
-				return nil, fmt.Errorf("%s allows at most %s", id, plural(int(entry.U), "unit"))
+			if override > entry.Units {
+				return nil, fmt.Errorf("%s allows at most %s", id, plural(int(entry.Units), "unit"))
 			}
 			units = override
 		}
-		out = append(out, &course{id: id, units: units, title: entry.T})
+		out = append(out, &course{id: id, units: units, title: entry.Title})
 	}
 	if len(out) == 0 {
 		return nil, errors.New("no courses given")
@@ -812,14 +817,14 @@ func trimTitle(s string, n int) string {
 
 func report(ui *ui, courses []*course) int {
 	ui.rule("summary")
-	out := 0
+	outstanding := 0
 	for _, c := range courses {
 		if c.done {
 			ui.good("  registered   %-9s %-30s at %s after %d attempt(s)",
 				c.id, trimTitle(c.title, 30), c.landed.Format("15:04:05.000"), c.attempts)
 			continue
 		}
-		out++
+		outstanding++
 		last := c.last
 		if last == "" {
 			last = "no attempt"
@@ -827,7 +832,7 @@ func report(ui *ui, courses []*course) int {
 		ui.bad("  outstanding  %-9s %-30s %d attempt(s), last %s",
 			c.id, trimTitle(c.title, 30), c.attempts, last)
 	}
-	if out == 0 {
+	if outstanding == 0 {
 		ui.good("  everything landed")
 		return 0
 	}
@@ -877,7 +882,6 @@ const (
 	kindGood kind = iota
 	kindBad
 	kindWarn
-	kindInfo
 )
 
 type ui struct {
@@ -951,13 +955,6 @@ func (u *ui) rule(title string) {
 	u.emit(u.paint(cBold, "== "+title+" "+strings.Repeat("=", max(0, 56-len(title)))))
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func (u *ui) ask(prompt string) string {
 	fmt.Print(prompt)
 	line, err := u.in.ReadString('\n')
@@ -983,7 +980,7 @@ func (u *ui) setRemaining(n int) {
 	}
 }
 
-// attempt prints one burst line:
+// attempt prints one attempt line:
 //
 //	16:00:00.412  #1  22034-2  OK  -> registered in 412ms
 func (u *ui) attempt(c *course, result, note string, rtt time.Duration, k kind) {
@@ -1005,7 +1002,7 @@ func (u *ui) attempt(c *course, result, note string, rtt time.Duration, k kind) 
 	u.emit(line)
 }
 
-func (u *ui) showMath(s *clockSync) {
+func (u *ui) showClockSync(s *clockSync) {
 	u.rule("clock sync")
 	drift := s.recv.Sub(s.server)
 	dir := "ahead of"
@@ -1017,16 +1014,16 @@ func (u *ui) showMath(s *clockSync) {
 	u.plain("  round trip        %s", s.rtt.Truncate(time.Millisecond))
 	u.plain("  server clock      %s  (server)", s.server.Format("15:04:05.000"))
 	u.plain("  your clock is     %s %s the server", drift.Truncate(time.Millisecond), dir)
-	reg := s.registrat.Format("2006-01-02 15:04:05")
+	reg := s.registration.Format("2006-01-02 15:04:05")
 	if s.stale {
 		u.plain("  registrationTime  %s  %s", reg,
-			u.paint(cYell, fmt.Sprintf("(stale, passed %s ago)", humanDur(s.server.Sub(s.registrat)))))
+			u.paint(cYell, fmt.Sprintf("(stale, passed %s ago)", humanDur(s.server.Sub(s.registration)))))
 	} else {
 		u.plain("  registrationTime  %s", reg)
 	}
 }
 
-func (u *ui) showFormula(s *clockSync, target, fireAt time.Time) {
+func (u *ui) showFireTime(s *clockSync, target, fireAt time.Time) {
 	gap := target.Sub(s.server)
 	u.plain("")
 	u.plain("  fire = received + (window - serverClock) + roundTrip + 100ms")

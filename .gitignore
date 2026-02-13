@@ -1,7 +1,5 @@
 # build output
-/EduReq
 /sniper
-/my.edu.sharif.edu-sniper
 *.exe
 
 # run transcripts, they contain your Authorization token

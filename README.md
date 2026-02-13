@@ -30,7 +30,7 @@ go install github.com/erfnzdeh/my.edu.sharif.edu-sniper/cmd/sniper@latest
 It will ask for your token and your courses. To skip the prompts:
 
 ```
-./sniper -token "$EDU_TOKEN" -courses 40404-1,22034-2,30004-1 -at 16:00 -y
+./sniper -token "$MYEDU_TOKEN" -courses 40404-1,22034-2,30004-1 -at 16:00 -y
 ```
 
 Log in at [my.edu.sharif.edu](https://my.edu.sharif.edu) shortly before your
@@ -169,7 +169,7 @@ capacity at dump time, which goes stale quickly.
 Regenerate it once per semester, after the offered list is final:
 
 ```
-EDU_TOKEN='<Authorization header>' node tools/catalogue/dump.mjs
+MYEDU_TOKEN='<Authorization header>' node tools/catalogue/dump.mjs
 ```
 
 It needs Node 22 or newer for the global `WebSocket` and has no dependencies.
@@ -198,7 +198,7 @@ curl https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/api/courses.json
 
 | Flag | Meaning |
 | --- | --- |
-| `-token` | Authorization header value. Also read from `EDU_TOKEN`. |
+| `-token` | Authorization header value. Also read from `MYEDU_TOKEN`. |
 | `-courses` | Comma separated, in priority order, for example `40404-1,22034-2:1`. |
 | `-at` | Window time as `HH:MM`. Required with `-y` when `registrationTime` is stale. |
 | `-y` | Skip the confirmation prompt. Needs `-token` and `-courses`. |

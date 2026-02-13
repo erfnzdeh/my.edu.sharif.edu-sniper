@@ -4,7 +4,7 @@
 //
 // Run once per semester, after the course list is finalised:
 //
-//   EDU_TOKEN='<Authorization header value>' node tools/catalogue/dump.mjs
+//   MYEDU_TOKEN='<Authorization header value>' node tools/catalogue/dump.mjs
 //
 // Requires Node 22+ for the global WebSocket. No dependencies.
 
@@ -17,12 +17,12 @@ const OUT = resolve(ROOT, 'docs', 'api')
 const WS_URL = 'wss://my.edu.sharif.edu/api/ws?token='
 const TIMEOUT_MS = 60000
 
-const token = (process.env.EDU_TOKEN || '').trim()
+const token = (process.env.MYEDU_TOKEN || '').trim()
 if (!token) {
-  console.error('EDU_TOKEN is not set.')
+  console.error('MYEDU_TOKEN is not set.')
   console.error('Log in at https://my.edu.sharif.edu, copy the Authorization')
   console.error('request header from any API call, then re-run:')
-  console.error("  EDU_TOKEN='<token>' node tools/catalogue/dump.mjs")
+  console.error("  MYEDU_TOKEN='<token>' node tools/catalogue/dump.mjs")
   process.exit(2)
 }
 
