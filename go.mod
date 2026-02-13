@@ -1,3 +1,3 @@
-module EduReq
+module github.com/erfnzdeh/my.edu.sharif.edu-sniper
 
-go 1.19
+go 1.22
