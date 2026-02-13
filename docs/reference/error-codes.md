@@ -119,11 +119,11 @@ course code cannot be checked against `/api/reg` before the window.
 
 ---
 
-## Gaps against `main.go`
+## Gaps against `permanentFailures`
 
-`permanent` in `main.go` currently holds 12 codes. These look like they belong
-there too, and are worth a second opinion before adding, since none has been
-observed live:
+`permanentFailures` in `cmd/sniper/main.go` currently holds 12 codes. These
+look like they belong there too, and are worth a second opinion before adding,
+since none has been observed live:
 
 | Code | Why it looks permanent |
 | --- | --- |
