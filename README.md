@@ -7,8 +7,10 @@ registration window opens. It syncs to the server's clock, sleeps until the
 window, then works through your course list until everything lands.
 
 Almost every design choice here is a reaction to a measured behaviour of the
-registration API rather than a matter of taste, so this document records the
-measurements first and the decisions that follow from them.
+registration API rather than a matter of taste. This document covers the tool:
+how to run it, and why it is built the way it is. The behaviours it is reacting
+to are written up separately in [docs/reference](docs/reference/), starting
+with [the server contract](docs/reference/server-contract.md).
 
 ---
 
@@ -28,35 +30,6 @@ It will ask for your token and your courses. To skip the prompts:
 Log in at [my.edu.sharif.edu](https://my.edu.sharif.edu) shortly before your
 window, open the browser network tab, and copy the `Authorization` request
 header from any API call. Sessions last roughly an hour.
-
----
-
-## The server contract
-
-Established by measuring the live endpoint and reading the portal's own
-frontend bundle. None of it is documented by the university.
-
-| Measured behaviour | Consequence for the client |
-| --- | --- |
-| The edge allows **exactly one request per second, with no burst**, and rejects the rest with a real HTTP `429` and an HTML body. | A parallel burst throws most of its requests away. Pacing is the single most important thing the client does. |
-| **Every** request to the host counts, including a plain `GET /`. | Connection warm up must happen well before the window, never immediately before it. |
-| Application errors arrive as **HTTP 200** with an `error` field in the JSON body. | Status codes cannot be used to detect failure, apart from `429`. |
-| Auth failure is `{"error":"AUTHORIZATION"}`, never a `401`. | The token check has to read the body. |
-| Tokens carry **no `exp` claim** and expire server side after roughly an hour. | Expiry cannot be predicted, only observed. Capture the token shortly before you need it. |
-| A request before your window is rejected with `NO_REGISTRATION_TIME`, and that takes precedence over course validation. | Course codes cannot be checked against `/api/reg` ahead of time. |
-| The response carries `time` and `registrationTime` as Unix milliseconds. | The client can measure its clock offset without trusting its own. |
-| `registrationTime` **goes stale** and can point at a window weeks past. | The target time often has to come from you. There are two daily windows, 08:00 and 16:00. |
-| `jobs` is ordered **newest first** and accumulates for the whole session. | Reading it backwards returns the oldest result for a course and misses a later success. |
-| A job with **no `result`** is still queued server side. | Absence of a result is not failure. |
-| The response describes **every** job, not just the one you asked about. | One request can reveal that a different course already landed. |
-| `units` is **range checked** against the course, and a mismatch fails with `INCORRECT_UNIT_NUMBER`. | Units cannot be guessed. See the catalogue below. |
-| `remainingActions` is a real quota, with its own `NO_REMAINED_ACTION` code. | Worth watching during add and drop. |
-| The course catalogue is served **only over a WebSocket**, never REST. | Hence the separate catalogue tool. |
-| A cold TLS handshake costs about 650ms against 170ms on a pooled connection. | Worth warming, at the right moment. |
-
-Both `time` and `registrationTime` are Unix timestamps, so comparing them is
-timezone independent. The portal is only reachable from inside Iran, so local
-time and server time agree.
 
 ---
 
@@ -117,10 +90,10 @@ sequenceDiagram
 
 ## Decision 1: pace at one request per second
 
-This is the whole game. Measured at 0.5s spacing, responses alternate
-perfectly between `200` and `429`. At 0.34s spacing, the successes still land
-about 1.25 seconds apart. The limit is one request per second, applied per
-client, and excess requests are rejected rather than queued.
+This is the whole game. The edge allows one request per second, applied per
+client, and rejects the excess with a real `429` rather than queueing it. A
+parallel burst therefore throws most of its requests away. Full measurements in
+[docs/reference/rate-limits.md](docs/reference/rate-limits.md).
 
 So the scheduler holds a single global token, released every 1.1 seconds, and
 spends it on the highest priority course that is off its own cooldown:
@@ -166,10 +139,10 @@ derivation with your actual numbers before it commits to a fire time.
 ## Decision 4: units come from the catalogue
 
 The portal range checks units between `0` and the course's own value, and
-courses flagged `isVariable` accept anything in that range. Hardcoding a value
-is not safe. On one real ten course list, five courses were not three units
-and one was zero, so a hardcoded `3` would have failed half the list with
-`INCORRECT_UNIT_NUMBER`.
+courses flagged `isVariable` accept anything in that range. A mismatch fails
+with `INCORRECT_UNIT_NUMBER`, so hardcoding a value is not safe. On one real
+ten course list, five courses were not three units and one was zero, so a
+hardcoded `3` would have failed half the list.
 
 The catalogue also means a wrong course code is caught while you are typing it
 rather than at the window.
@@ -234,36 +207,33 @@ token**, so they are gitignored. Delete them when you are done.
 
 ---
 
-## Error codes
+## Reference
 
-The full set, read out of the portal's frontend bundle. Note that
-`COURSE_NOT_FOUND` does not exist. The real code is `INVALID_COURSE`.
+The portal's API is undocumented by the university, so it was reverse
+engineered from the live endpoint and the frontend bundle. Those notes live in
+[docs/reference](docs/reference/) rather than here:
 
-| Retryable | Permanent for that course | System or timing |
-| --- | --- | --- |
-| `CAPACITY_EXCEEDED` | `INVALID_COURSE` | `NO_REGISTRATION_TIME` |
-| `REPEATED_REQUEST` | `INCORRECT_UNIT_NUMBER` | `REGISTRATION_TIME_LIMIT` |
-| `ALREADY_IN_QUEUE` | `UNITS_LIMIT` | `LOGIN_TIME_RESTRICTION` |
-| `PLEASE_WAIT` | `CLASS_OVERLAP` | `TOO_MANY_REQUESTS` |
-| `CONNECTION_ERROR` | `EXAM_OVERLAP` | `AUTHORIZATION` |
-| `DATABASE_QUERY_ERROR` | `COURSE_DUPLICATE` | `NO_REMAINED_ACTION` |
-| | `COURSE_TAKEN_BEFORE` | `INVALID_ACTION` |
-| | `MAAREF_COURSES_LIMIT` | `CONSTRAINTS_VIOLATED` |
-| | `INCOMPATIBLE_CAMPUS` | `CANNOT_ADD_COURSE_IN_TARMIM` |
-| | `INCOMPATIBLE_GENDER` | `CANNOT_REMOVE_COURSE_IN_TARMIM` |
-| | `UNSUPPORTED_COURSE_TYPE` | `CANNOT_REMOVE_COURSE` |
-| | `NO_PERMISSION` | `INVALID_MOVE`, `INVALID_REMOVE` |
-| | `REGISTER_IN_EDU` | `HAS_INCOMPLETE_PROJECT` |
-| | `PROJECT_FIRST_REGISTRATION` | |
-
-Every course is retried regardless, because you are watching and can judge
-better than a rule can. Permanent failures are called out in the log with a
-plain explanation so they are obvious at a glance.
+| Document | Covers |
+| --- | --- |
+| [server-contract.md](docs/reference/server-contract.md) | every measured behaviour and what it forces the client to do |
+| [http-api.md](docs/reference/http-api.md) | the five endpoints and their request and response shapes |
+| [websocket.md](docs/reference/websocket.md) | the only source of course data, and the `userState` and course schemas |
+| [rate-limits.md](docs/reference/rate-limits.md) | all three limiters, measured |
+| [auth.md](docs/reference/auth.md) | token shape, lifetime, and why the WebSocket ignores it |
+| [error-codes.md](docs/reference/error-codes.md) | triage, plus every code with its Persian text and meaning |
 
 ---
 
 ## TODO
 
+- **Reconsider `globalGap`.** Re-measured on a warm pooled connection, 1.10s
+  passed 12 of 14 requests while 1.30s passed 14 of 14. The limit is still one
+  per second; the losses are round trip jitter, which ranged from 46ms to
+  2037ms within a single run. Since a `429` currently backs every course off by
+  7 seconds, paying 200ms more per request to avoid a roughly one in seven
+  chance of that stall looks like a clear win. Worth re-running from the campus
+  network before changing the constant, since the jitter is what drives it.
+  Numbers in [docs/reference/rate-limits.md](docs/reference/rate-limits.md).
 - **Median of N clock probes.** The offset comes from a single probe today, so
   one unlucky packet skews the fire time. Before the window, extra probes are
   nearly free because their cooldowns expire long before firing. Taking the
