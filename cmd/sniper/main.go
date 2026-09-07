@@ -20,6 +20,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -120,6 +122,47 @@ type course struct {
 	last     string // most recent result seen
 }
 
+// version is the release tag. It is injected at build time with
+//
+//	go build -ldflags "-X main.version=v1.2.3"
+//
+// and is empty in a build that was not stamped, where buildVersion falls back
+// to the revision the toolchain records in the binary.
+var version = ""
+
+// buildVersion is what the banner, the transcript and -version report. It is
+// the first thing to ask for in a bug report, so an unstamped local build
+// still has to answer it usefully.
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	var rev string
+	var dirty bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return "dev"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return "dev-" + rev
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -132,8 +175,15 @@ func run() int {
 		fYes        = flag.Bool("y", false, "skip the confirmation prompt, requires -token and -courses")
 		fCatalogue  = flag.String("catalogue", "", "path or URL of courses.json, overrides the default lookup")
 		fTranscript = flag.String("transcript", "", "transcript file path, defaults to snipe-<timestamp>.log")
+		fVersion    = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	if *fVersion {
+		fmt.Printf("sniper %s %s/%s %s\n",
+			buildVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return 0
+	}
 
 	ui := newUI()
 	ui.banner()
@@ -947,7 +997,7 @@ func (u *ui) fatal(f string, a ...any) {
 }
 
 func (u *ui) banner() {
-	u.emit(u.paint(cBold, "my.edu.sharif.edu sniper"))
+	u.emit(u.paint(cBold, "my.edu.sharif.edu sniper "+buildVersion()))
 }
 
 func (u *ui) rule(title string) {

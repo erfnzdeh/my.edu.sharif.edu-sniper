@@ -37,6 +37,9 @@ Log in at [my.edu.sharif.edu](https://my.edu.sharif.edu) shortly before your
 window, open the browser network tab, and copy the `Authorization` request
 header from any API call. Sessions last roughly an hour.
 
+Every run prints its version in the banner and the transcript, and
+`sniper -version` reports it on its own. Quote it in any bug report.
+
 ---
 
 ## Architecture
