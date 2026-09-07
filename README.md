@@ -26,7 +26,7 @@ an Intel Mac). The binary is unsigned, so Gatekeeper needs to be told once:
 
 ```
 chmod +x sniper_darwin_arm64
-xattr -d com.apple.quarantine sniper_darwin_arm64
+xattr -c sniper_darwin_arm64
 ./sniper_darwin_arm64
 ```
 
