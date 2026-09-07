@@ -5,8 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        The open ideas already on the list are at the bottom of the
-        [README](https://github.com/erfnzdeh/my.edu.sharif.edu-sniper#todo).
+        The ideas already on the list are the open [enhancement
+        issues](https://github.com/erfnzdeh/my.edu.sharif.edu-sniper/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement).
         Worth a look first.
 
   - type: textarea
