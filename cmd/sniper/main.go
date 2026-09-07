@@ -893,8 +893,8 @@ type ui struct {
 
 func newUI() *ui {
 	u := &ui{in: bufio.NewReader(os.Stdin)}
-	if fi, err := os.Stdout.Stat(); err == nil {
-		u.color = fi.Mode()&os.ModeCharDevice != 0
+	if fi, err := os.Stdout.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		u.color = enableANSI(os.Stdout.Fd())
 	}
 	return u
 }
