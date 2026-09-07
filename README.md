@@ -271,28 +271,6 @@ engineered from the live endpoint and the frontend bundle. Those notes live in
 
 ---
 
-## TODO
-
-- **Reconsider `globalGap`.** Re-measured on a warm pooled connection, 1.10s
-  passed 12 of 14 requests while 1.30s passed 14 of 14. The limit is still one
-  per second; the losses are round trip jitter, which ranged from 46ms to
-  2037ms within a single run. Since a `429` currently backs every course off by
-  7 seconds, paying 200ms more per request to avoid a roughly one in seven
-  chance of that stall looks like a clear win. Worth re-running from the campus
-  network before changing the constant, since the jitter is what drives it.
-  Numbers in [docs/reference/rate-limits.md](docs/reference/rate-limits.md).
-- **Median of N clock probes.** The offset comes from a single probe today, so
-  one unlucky packet skews the fire time. Before the window, extra probes are
-  nearly free because their cooldowns expire long before firing. Taking the
-  median of three or five, and printing the spread, would make the measurement
-  honest and show how jittery the link is.
-- **Support `remove` and `move` for add and drop.** The API takes three
-  actions, not one. Adding `remove`, and `move` for changing group, would make
-  the tool useful during add and drop rather than only at registration.
-  Removals are irreversible, so they need a confirmation the adds do not.
-
----
-
 ## Contributing
 
 Bug reports, catalogue corrections and pull requests are all welcome.
