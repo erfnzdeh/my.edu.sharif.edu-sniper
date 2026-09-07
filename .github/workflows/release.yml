@@ -52,22 +52,19 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            Registers courses on the Sharif student portal the moment your
-            registration window opens. Nothing to install: pick the one file
-            below that matches your machine and run it from a terminal.
+            Registers courses on the Sharif student portal the moment your registration window opens. Nothing to install: pick the one file below that matches your machine and run it from a terminal.
 
             ## 1. Download the right file
 
             | Your machine | File |
             | --- | --- |
-            | Mac with Apple silicon (M1 and later) | `sniper_darwin_arm64` |
-            | Mac with an Intel chip | `sniper_darwin_amd64` |
-            | Windows | `sniper_windows_amd64.exe` |
-            | Linux, 64-bit | `sniper_linux_amd64` |
-            | Linux, ARM (Raspberry Pi and similar) | `sniper_linux_arm64` |
+            | Mac with Apple silicon (M1 and later) | [`sniper_darwin_arm64`](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/sniper_darwin_arm64) |
+            | Mac with an Intel chip | [`sniper_darwin_amd64`](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/sniper_darwin_amd64) |
+            | Windows | [`sniper_windows_amd64.exe`](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/sniper_windows_amd64.exe) |
+            | Linux, 64-bit | [`sniper_linux_amd64`](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/sniper_linux_amd64) |
+            | Linux, ARM (Raspberry Pi and similar) | [`sniper_linux_arm64`](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/sniper_linux_arm64) |
 
-            Not sure which Mac you have? Apple menu, then "About This Mac".
-            A "Chip" line starting with "Apple" means `arm64`.
+            Not sure which Mac you have? Apple menu, then "About This Mac". A "Chip" line starting with "Apple" means `arm64`.
 
             ## 2. Run it
 
@@ -79,8 +76,7 @@ jobs:
             ./sniper_darwin_arm64
             ```
 
-            The `xattr` line is needed once, because the binary is not signed
-            with a paid Apple certificate. Without it macOS refuses to open it.
+            The `xattr` line is needed once, because the binary is not signed with a paid Apple certificate. Without it macOS refuses to open it.
 
             **Linux.** Open a terminal in the download folder:
 
@@ -95,27 +91,15 @@ jobs:
             .\sniper_windows_amd64.exe
             ```
 
-            SmartScreen may warn about an unknown publisher the first time.
-            Choose "More info", then "Run anyway".
+            SmartScreen may warn about an unknown publisher the first time. Choose "More info", then "Run anyway".
 
             ## 3. Answer the two questions
 
-            It asks for your login token and then your courses, and explains
-            what it is going to do before it does anything.
+            It asks for your login token and then your courses, and explains what it is going to do before it does anything.
 
-            **The token.** Log in at <https://my.edu.sharif.edu> shortly before
-            your window. Open your browser's developer tools (F12 on Windows
-            and Linux, Cmd+Option+I on a Mac), go to the Network tab, click
-            anything in the portal, and copy the whole `Authorization` header
-            off one of the requests. Tokens last about an hour, so fetch it
-            close to your window rather than the night before.
+            **The token.** Log in at <https://my.edu.sharif.edu> shortly before your window. Open your browser's developer tools (F12 on Windows and Linux, Cmd+Option+I on a Mac), go to the Network tab, click anything in the portal, and copy the whole `Authorization` header off one of the requests. Tokens last about an hour, so fetch it close to your window rather than the night before.
 
-            **The courses.** One per line as `CODE-GROUP`, for example
-            `22034-2`, with a blank line to finish. Each one is checked against
-            the course catalogue as you type it, so a typo is caught there and
-            then rather than at the window. **Order matters:** requests are
-            paced at roughly one per second, so list the courses that fill
-            fastest first.
+            **The courses.** One per line as `CODE-GROUP`, for example `22034-2`, with a blank line to finish. Each one is checked against the course catalogue as you type it, so a typo is caught there and then rather than at the window. **Order matters:** requests are paced at roughly one per second, so list the courses that fill fastest first.
 
             If you would rather skip the questions entirely:
 
@@ -123,24 +107,16 @@ jobs:
             ./sniper -token "<your token>" -courses 40404-1,22034-2 -at 16:00 -y
             ```
 
-            Then leave it running. It syncs to the server's clock, sleeps until
-            your window opens, and keeps trying each course until it lands or
-            you stop it. It prints a summary at the end and writes a full
-            transcript next to itself.
+            Then leave it running. It syncs to the server's clock, sleeps until your window opens, and keeps trying each course until it lands or you stop it. It prints a summary at the end and writes a full transcript next to itself.
 
             ## Good to know
 
-            - The transcript file contains your token. Delete it when you are
-              done, and never paste it into an issue.
-            - Everything is one file with no installer and no background
-              service. Delete the binary to uninstall.
-            - `SHA256SUMS` in the assets below lets you verify your download:
-              `shasum -a 256 -c SHA256SUMS` on macOS or Linux.
+            - The transcript file contains your token. Delete it when you are done, and never paste it into an issue.
+            - Everything is one file with no installer and no background service. Delete the binary to uninstall.
+            - [`SHA256SUMS`](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SHA256SUMS) lets you verify your download: `shasum -a 256 -c SHA256SUMS` on macOS or Linux.
             - Run `./sniper -version` and quote the output in any bug report.
 
-            Full documentation, flags and the reverse engineering notes are in
-            the [README](https://github.com/${{ github.repository }}#readme).
-
+            Full documentation, flags and the reverse engineering notes are in the [README](https://github.com/${{ github.repository }}#readme).
       - name: Upload the dry run binaries
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
