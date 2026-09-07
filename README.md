@@ -16,18 +16,36 @@ with [the server contract](docs/reference/server-contract.md).
 
 ## Quick start
 
+You do not need Go, or anything else, installed. Every release ships a single
+self contained binary per platform on the
+[releases page](https://github.com/erfnzdeh/my.edu.sharif.edu-sniper/releases/latest).
+Download the one for your machine, then run it from a terminal.
+
+**macOS** (`sniper_darwin_arm64` for Apple silicon, `sniper_darwin_amd64` for
+an Intel Mac). The binary is unsigned, so Gatekeeper needs to be told once:
+
 ```
-go build -o sniper ./cmd/sniper
-./sniper
+chmod +x sniper_darwin_arm64
+xattr -d com.apple.quarantine sniper_darwin_arm64
+./sniper_darwin_arm64
 ```
 
-Or straight from the module, no clone needed:
+**Linux** (`sniper_linux_amd64`, or `sniper_linux_arm64`):
 
 ```
-go install github.com/erfnzdeh/my.edu.sharif.edu-sniper/cmd/sniper@latest
+chmod +x sniper_linux_amd64
+./sniper_linux_amd64
 ```
 
-It will ask for your token and your courses. To skip the prompts:
+**Windows** (`sniper_windows_amd64.exe`). Open PowerShell in the download
+folder and run it. SmartScreen may warn about an unknown publisher the first
+time, under "More info" and then "Run anyway":
+
+```
+.\sniper_windows_amd64.exe
+```
+
+It will then ask for your token and your courses. To skip the prompts:
 
 ```
 ./sniper -token "$MYEDU_TOKEN" -courses 40404-1,22034-2,30004-1 -at 16:00 -y
@@ -39,6 +57,25 @@ header from any API call. Sessions last roughly an hour.
 
 Every run prints its version in the banner and the transcript, and
 `sniper -version` reports it on its own. Quote it in any bug report.
+
+The binary carries no data files. It reads the course catalogue from
+`docs/api/courses.json` next to it if you cloned the repository, and otherwise
+fetches the published copy over HTTPS, so a lone binary is fully functional.
+
+### Building it yourself
+
+If you do have Go, the build is the ordinary one and needs no dependencies:
+
+```
+go build -o sniper ./cmd/sniper
+./sniper
+```
+
+Or straight from the module, no clone needed:
+
+```
+go install github.com/erfnzdeh/my.edu.sharif.edu-sniper/cmd/sniper@latest
+```
 
 ---
 
@@ -207,6 +244,7 @@ curl https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/api/courses.json
 | `-y` | Skip the confirmation prompt. Needs `-token` and `-courses`. |
 | `-catalogue` | Path or URL of `courses.json`. |
 | `-transcript` | Transcript path. Defaults to `snipe-<timestamp>.log`. |
+| `-version` | Print the version, platform and Go version, then exit. |
 
 Exit codes: `0` when everything landed, `1` when something is still
 outstanding, `2` for a setup or authentication failure.
