@@ -290,3 +290,22 @@ engineered from the live endpoint and the frontend bundle. Those notes live in
   actions, not one. Adding `remove`, and `move` for changing group, would make
   the tool useful during add and drop rather than only at registration.
   Removals are irreversible, so they need a confirmation the adds do not.
+
+---
+
+## Contributing
+
+Bug reports, catalogue corrections and pull requests are all welcome.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the build, and the handful of rules
+that matter here: no dependencies in `cmd/sniper`, timing constants change
+only with measurements behind them, and no token ever reaches a commit or an
+issue. Security problems go through [SECURITY.md](SECURITY.md) rather than the
+issue tracker. Everyone taking part is expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+[MIT](LICENSE). The reverse engineering notes in
+[docs/reference](docs/reference/) are covered by the same license. This project
+is not affiliated with, endorsed by, or supported by Sharif University of
+Technology.

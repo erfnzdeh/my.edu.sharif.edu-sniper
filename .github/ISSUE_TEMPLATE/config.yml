@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/erfnzdeh/my.edu.sharif.edu-sniper/security/advisories/new
+    about: Report privately instead of opening an issue. See SECURITY.md.
+  - name: How the portal behaves
+    url: https://github.com/erfnzdeh/my.edu.sharif.edu-sniper/tree/main/docs/reference
+    about: Rate limits, error codes, auth and the WebSocket are all written up here.
+  - name: A problem with my.edu.sharif.edu itself
+    url: https://my.edu.sharif.edu
+    about: The portal belongs to Sharif University. This repository cannot fix it.
