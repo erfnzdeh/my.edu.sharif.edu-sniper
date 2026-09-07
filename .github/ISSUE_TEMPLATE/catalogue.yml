@@ -1,0 +1,35 @@
+name: Catalogue problem
+description: A course is missing, or its units, title or group are wrong
+labels: ["catalogue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `docs/api/courses.json` is dumped from the portal by hand once a
+        semester, so it goes stale. Capacity in particular (`c`) is expected to
+        be wrong within hours of the dump and is not worth reporting.
+
+  - type: input
+    id: course
+    attributes:
+      label: Course
+      description: Code and group, as you typed it.
+      placeholder: 40404-1
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What the portal says
+      description: >
+        The title, unit count and whether the portal lets you choose the units,
+        as shown on the offered course list.
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What the sniper said
+      description: The error or the wrong value it used, token removed.

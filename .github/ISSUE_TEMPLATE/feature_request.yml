@@ -1,0 +1,45 @@
+name: Feature request
+description: Something the sniper should do and does not
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The open ideas already on the list are at the bottom of the
+        [README](https://github.com/erfnzdeh/my.edu.sharif.edu-sniper#todo).
+        Worth a look first.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What went wrong, or what you could not do, that led to this.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Measurements, if the change touches timing
+      description: >
+        Changes to pacing, cooldowns or the fire time need numbers: how you
+        measured, from which network, over how many requests. See
+        docs/reference/rate-limits.md for the format the existing constants
+        were established in.
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This does not send more requests than one per second.
+          required: true
+        - label: This does not require a third party dependency, or I have said why one is unavoidable.
+          required: true

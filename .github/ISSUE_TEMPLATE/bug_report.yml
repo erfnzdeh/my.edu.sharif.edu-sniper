@@ -1,0 +1,81 @@
+name: Bug report
+description: Something the sniper did that it should not have
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you paste anything: transcripts contain your `Authorization`
+        token verbatim. Remove it from every excerpt you attach.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From the banner, the transcript, or `sniper -version`.
+      placeholder: v1.2.0, or dev-4a27d9f
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux amd64
+        - Linux arm64
+        - Windows amd64
+        - Built from source, other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what the tool did instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >
+        The command you ran, with the token removed, and anything about the
+        situation that seems relevant: how many courses, whether the window
+        was open, which network you were on.
+      placeholder: ./sniper -courses 40404-1,22034-2 -at 16:00 -y
+    validations:
+      required: true
+
+  - type: textarea
+    id: transcript
+    attributes:
+      label: Transcript excerpt
+      description: >
+        The relevant lines, token removed. The clock sync derivation and the
+        requests around the failure are usually the useful part.
+      render: text
+
+  - type: dropdown
+    id: catalogue
+    attributes:
+      label: Which catalogue was in use
+      options:
+        - The published copy, fetched over HTTPS
+        - docs/api/courses.json from a clone
+        - A path or URL passed with -catalogue
+        - Not sure
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have removed my token from everything pasted above.
+          required: true
+        - label: I am on the latest release, or I have said why I am not.
+          required: true
