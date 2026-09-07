@@ -36,9 +36,22 @@ jobs:
                 -ldflags "-s -w -X main.version=${VERSION}" \
                 -o "$out" ./cmd/sniper
           done
-          cd dist && sha256sum * > SHA256SUMS
+          cd dist && sha256sum -- * > SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      # A tag is the only thing GitHub will hang a release off, so a manual
+      # run is a dry run: it proves the matrix still builds and leaves the
+      # binaries on the run page, without inventing a tag to publish under.
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
+
+      - name: Upload the dry run binaries
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sniper-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
