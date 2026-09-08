@@ -18,6 +18,11 @@ jobs:
         with:
           go-version: stable
 
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test -race ./...
+
       - name: Build every target
         env:
           VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
