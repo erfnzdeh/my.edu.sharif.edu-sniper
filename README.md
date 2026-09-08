@@ -55,6 +55,11 @@ Log in at [my.edu.sharif.edu](https://my.edu.sharif.edu) shortly before your
 window, open the browser network tab, and copy the `Authorization` request
 header from any API call. Sessions last roughly an hour.
 
+Then leave the portal alone until the run is over. The edge limiter counts
+every request from your IP, so a click in the browser during the window costs
+the sniper a `429`, and one run on 2026-09-08 took a rejection that its own
+traffic cannot explain.
+
 Every run prints its version in the banner and the transcript, and
 `sniper -version` reports it on its own. Quote it in any bug report.
 
@@ -227,13 +232,19 @@ toward the window. Given a probe sent at `t0`, answered at `t1`, with the
 server reporting `S` and the window at `R`:
 
 ```
-fire = t1 + (R - S) + roundTrip + 100ms
+fire = t1 + (R - S) + 100ms
 ```
 
-The margin is biased late deliberately. Arriving early is rejected **and**
-burns that course's five second cooldown, so a request 100ms early costs about
-five seconds. A request 100ms late costs 100ms. The client prints this
-derivation with your actual numbers before it commits to a fire time.
+That is later than it looks. The server stamps `S` as it answers, so by `t1`
+its clock is already half a round trip past `S`, and the request spends the
+other half on the way in: it reaches the server a full network round trip
+after the window opens, plus the 100ms. The margin is biased late
+deliberately, because arriving early is rejected and puts that course on its
+five second cooldown, while arriving late costs only the delay. The formula
+used to add the probe's round trip too, and since the probe runs on a cold
+connection that included a TLS handshake: one run on 2026-09-08 fired 1.2s
+after the window for nothing. The client prints the derivation with your
+actual numbers before it commits to a fire time.
 
 ## Decision 5: units come from the catalogue
 

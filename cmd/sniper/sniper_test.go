@@ -310,6 +310,118 @@ func TestPostReportsRateLimiting(t *testing.T) {
 	}
 }
 
+// TestApplyJobsReadsTheNewestJobEvenBeforeItIsJudged pins the run A shape of
+// 2026-09-08: the course's own job is still queued, and an older job for the
+// same course carries a stale verdict. The stale one must not be read.
+func TestApplyJobsReadsTheNewestJobEvenBeforeItIsJudged(t *testing.T) {
+	courses := mkCourses("37514-2", "40416-1")
+	pick := courses[0]
+	pick.next = time.Now().Add(courseCooldown)
+	resp := &regResponse{Jobs: []job{
+		{CourseID: "37514-2", Result: ""},              // this attempt, not judged yet
+		{CourseID: "37514-2", Result: "CLASS_OVERLAP"}, // an earlier attempt
+		{CourseID: "40416-1", Result: resultOK},
+	}}
+	applyJobs(newTestUI(), courses, pick, 1, resp, 0)
+
+	if pick.last != "QUEUED" {
+		t.Fatalf("last = %q, want QUEUED, the stale verdict was read instead", pick.last)
+	}
+	if pick.parked {
+		t.Fatal("a stale CLASS_OVERLAP parked a course whose real job is still queued")
+	}
+	if pick.judged != 1 {
+		t.Fatalf("judged = %d, want 1, the backend did see the request", pick.judged)
+	}
+	if !courses[1].done {
+		t.Fatal("an OK for another course was not harvested")
+	}
+}
+
+// TestFireTimeDoesNotAddTheProbeRoundTrip: the probe runs on a cold
+// connection, so its round trip includes a TLS handshake that the request at
+// the window will never pay. Sending at recv + (window - server) already lands
+// a network round trip late, and only the fixed 100ms goes on top.
+func TestFireTimeDoesNotAddTheProbeRoundTrip(t *testing.T) {
+	recv := time.Date(2026, 9, 8, 7, 53, 13, 153e6, time.Local)
+	s := &clockSync{
+		recv:   recv,
+		rtt:    582 * time.Millisecond,
+		server: recv.Add(541 * time.Millisecond),
+	}
+	window := time.Date(2026, 9, 8, 8, 0, 0, 0, time.Local)
+	got := s.fireTime(window)
+	want := recv.Add(window.Sub(s.server) + 100*time.Millisecond)
+	if !got.Equal(want) {
+		t.Fatalf("fireTime = %s, want %s", got.Format("15:04:05.000"), want.Format("15:04:05.000"))
+	}
+	// The local clock is 541ms behind the server, so add that to read the
+	// fire time on the server's clock.
+	if late := got.Add(541 * time.Millisecond).Sub(window); late != 100*time.Millisecond {
+		t.Fatalf("fires %s after the window by the server's clock, want 100ms", late)
+	}
+}
+
+func TestApplyCodeTimingRejectionKeepsThePlace(t *testing.T) {
+	c := &course{id: "30004-1", next: time.Now().Add(courseCooldown)}
+	applyCode(newTestUI(), c, 1, "NO_REGISTRATION_TIME", 0)
+	if c.judged != 0 || c.parked || c.done {
+		t.Fatalf("judged=%d parked=%t done=%t after NO_REGISTRATION_TIME, want 0 false false", c.judged, c.parked, c.done)
+	}
+	if c.last != "NO_REGISTRATION_TIME" {
+		t.Fatalf("last = %q, want the code recorded", c.last)
+	}
+	applyCode(newTestUI(), c, 2, "CAPACITY_EXCEEDED", 0)
+	if c.judged != 1 {
+		t.Fatalf("judged = %d after a real verdict, want 1", c.judged)
+	}
+}
+
+func TestPostTurnsAnErrorFieldIntoAResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"error":"TOO_MANY_REQUESTS"}`)
+	}))
+	defer srv.Close()
+	defer swap(&regEndpoint, srv.URL)()
+
+	cl := &client{http: &http.Client{Timeout: time.Second}}
+	_, _, err := cl.add(&course{id: "30004-1", units: 1})
+
+	var str *stringResult
+	if !errors.As(err, &str) {
+		t.Fatalf("err = %v, want a stringResult", err)
+	}
+	if str.code != "TOO_MANY_REQUESTS" {
+		t.Errorf("code = %q, want TOO_MANY_REQUESTS", str.code)
+	}
+	if holdResults[str.code].hold == 0 {
+		t.Errorf("TOO_MANY_REQUESTS does not hold the shared token")
+	}
+}
+
+// TestWarmUpDoesNotHoldTheWindow: the warm up GET is sent and forgotten. A
+// portal that sits on it must not delay the first real request, and the token
+// still counts from the moment it went out.
+func TestWarmUpDoesNotHoldTheWindow(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release) // runs before srv.Close, which waits for handlers
+	defer swap(&portalOrigin, srv.URL)()
+
+	cl := &client{http: &http.Client{Timeout: 5 * time.Second}}
+	before := time.Now()
+	cl.warmUp(newTestUI(), before.Add(50*time.Millisecond))
+	if took := time.Since(before); took > 500*time.Millisecond {
+		t.Fatalf("warmUp blocked for %s waiting on an answer that never came", took)
+	}
+	if called := cl.called(); called.Before(before) {
+		t.Fatalf("the token does not count from the warm up: last call %s, warm up at %s", called, before)
+	}
+}
+
 func swap[T any](p *T, v T) func() {
 	old := *p
 	*p = v
