@@ -2,14 +2,18 @@
 // registration window opens.
 //
 // The portal's edge allows exactly one request per second with no burst, so
-// the scheduler spends one request token at a time on the highest priority
-// course that is off its own cooldown. List order is priority order.
+// the scheduler spends one request token at a time. Every course gets its
+// first attempt before any course gets its second, and within the same
+// attempt count list order is priority order. Answers take seconds to come
+// back, so a few requests may be waiting at once: the token spacing is what
+// the edge cares about, not how many answers are outstanding.
 package main
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,27 +26,36 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-// Measured against the live API. See README for how these were established.
-const (
+// The live API. These are variables rather than constants only so the tests
+// can point the scheduler at a local stand in.
+var (
 	regEndpoint   = "https://my.edu.sharif.edu/api/reg"
 	portalOrigin  = "https://my.edu.sharif.edu"
 	portalReferer = "https://my.edu.sharif.edu/courses/offered"
+)
 
-	// The edge limiter permits one request per second and rejects anything
-	// faster outright, so leave a little headroom on the boundary.
-	globalGap = 1100 * time.Millisecond
-	// The portal also enforces five seconds between two requests for the
-	// same course. With five or more courses the global gap already covers
-	// this, but with fewer it is the binding constraint.
+// Measured against the live API. See README for how these were established.
+const (
+	// The portal enforces five seconds between two requests for the same
+	// course, measured from when the request was sent.
 	courseCooldown = 5200 * time.Millisecond
-	// Backoff applied to every course when the edge returns 429.
-	rateLimitBackoff = 7 * time.Second
+	// Backoff after the edge returns a 429. The edge allows one request per
+	// second, so a rejection only says the last one was too close. A long
+	// freeze costs far more than the rejection did: on 2026-09-08 two 429s
+	// cost fourteen seconds of the most contested part of the window.
+	rateLimitBackoff = 2 * time.Second
+	// How long to hold back a course whose result cannot change on a retry.
+	// It is still retried, because the operator may drop the course it
+	// clashes with, but it must not crowd out a course that can still land.
+	parkedBackoff = 45 * time.Second
 	// How far ahead of the window to open a connection, so the first real
 	// request does not pay a TLS handshake. It must not be closer than the
 	// global gap, because the warm up itself spends a request token.
@@ -55,6 +68,24 @@ const (
 	httpTimeout  = 10 * time.Second
 )
 
+// Pacing, overridable from the command line because the right values depend
+// on the link and both cost something when they are wrong.
+var (
+	// globalGap is the minimum spacing between two requests. The edge allows
+	// one per second and counts every request to the host, including the warm
+	// up. A 1.1s gap loses about one request in seven to round trip jitter,
+	// which is a bad trade now that a rejection is cheap but not free.
+	// See docs/reference/rate-limits.md.
+	globalGap = 1300 * time.Millisecond
+	// maxInflight is how many requests may be waiting for an answer at once.
+	// Inside the window a single answer took two to five seconds, and one
+	// that timed out held the whole queue for ten, so a strictly serial
+	// scheduler spends the contested seconds waiting rather than asking.
+	// The portal has a concurrency guard of its own, TOO_MANY_REQUESTS, so
+	// this stays small.
+	maxInflight = 3
+)
+
 // Result codes, taken from the portal frontend bundle.
 const (
 	resultOK        = "OK"
@@ -62,22 +93,41 @@ const (
 	resultAuthError = "AUTHORIZATION"
 )
 
-// permanentFailures lists the results that can never succeed on a retry. Courses are
-// still retried, because the operator watches the log and decides, but these
-// are called out loudly so a typo or a clash is obvious at a glance.
+// permanentFailures lists the results that can never succeed on a retry.
+// Courses are still retried, because the operator watches the log and may drop
+// whatever a course clashes with, but they go to the back of the queue and
+// wait parkedBackoff between tries so they cannot crowd out a course that can
+// still land. See docs/reference/error-codes.md.
 var permanentFailures = map[string]string{
-	"INVALID_COURSE":          "no such course, check the code and group",
-	"INCORRECT_UNIT_NUMBER":   "wrong unit count for this course",
-	"UNITS_LIMIT":             "this would exceed your total unit limit",
-	"CLASS_OVERLAP":           "class time clashes with another course",
-	"EXAM_OVERLAP":            "exam time clashes with another course",
-	"COURSE_TAKEN_BEFORE":     "already passed this course",
-	"MAAREF_COURSES_LIMIT":    "hit the limit on maaref courses",
-	"INCOMPATIBLE_CAMPUS":     "wrong campus",
-	"INCOMPATIBLE_GENDER":     "not open to your gender",
-	"UNSUPPORTED_COURSE_TYPE": "this course type cannot be added here",
-	"NO_REMAINED_ACTION":      "no registration actions left",
-	"NO_PERMISSION":           "no permission to register for this course",
+	"INVALID_COURSE":             "no such course, check the code and group",
+	"INCORRECT_UNIT_NUMBER":      "wrong unit count for this course",
+	"VARIABLE_UNITS_EXCEEDED":    "units above this course's variable range",
+	"ZERO_UNITS_NOT_POSSIBLE":    "this course cannot be taken for zero units",
+	"UNITS_LIMIT":                "this would exceed your total unit limit",
+	"CLASS_OVERLAP":              "class time clashes with another course",
+	"EXAM_OVERLAP":               "exam time clashes with another course",
+	"COURSE_TAKEN_BEFORE":        "already passed this course",
+	"COURSE_NOT_IN_CHART":        "not in your study chart",
+	"CONSTRAINTS_VIOLATED":       "a study plan constraint rejected it",
+	"MAAREF_COURSES_LIMIT":       "hit the limit on maaref courses",
+	"INCOMPATIBLE_CAMPUS":        "wrong campus",
+	"INCOMPATIBLE_GENDER":        "not open to your gender",
+	"UNSUPPORTED_COURSE_TYPE":    "this course type cannot be added here",
+	"NO_REMAINED_ACTION":         "no registration actions left",
+	"NO_PERMISSION":              "no permission to register for this course",
+	"REGISTER_IN_EDU":            "register for this one in the main edu system",
+	"HAS_INCOMPLETE_PROJECT":     "register your unfinished project or thesis first",
+	"PROJECT_FIRST_REGISTRATION": "the project course has to be registered first",
+}
+
+// queuedResults are not failures. The portal already holds a job for this
+// exact course, units and action, and will judge it on its own. Both
+// transcripts from 2026-09-08 show a course landing from a job that had
+// answered REPEATED_REQUEST moments earlier, so the worst thing to do is
+// spend another token on it right away.
+var queuedResults = map[string]string{
+	"REPEATED_REQUEST": "the portal already has this exact job queued",
+	"ALREADY_IN_QUEUE": "a job for this course is already queued",
 }
 
 type catalogueEntry struct {
@@ -112,11 +162,16 @@ type regResponse struct {
 }
 
 type course struct {
-	id       string
-	units    int32
-	title    string
-	attempts int
+	id    string
+	units int32
+	title string
+	pri   int // position in the list the operator gave, 0 is highest
+
+	attempts int       // requests sent for this course
+	judged   int       // requests the backend actually answered
 	next     time.Time // not eligible to be retried before this
+	pending  bool      // a request is in flight right now
+	parked   bool      // last result cannot change on a retry
 	done     bool
 	landed   time.Time
 	last     string // most recent result seen
@@ -175,9 +230,20 @@ func run() int {
 		fYes        = flag.Bool("y", false, "skip the confirmation prompt, requires -token and -courses")
 		fCatalogue  = flag.String("catalogue", "", "path or URL of courses.json, overrides the default lookup")
 		fTranscript = flag.String("transcript", "", "transcript file path, defaults to snipe-<timestamp>.log")
+		fGap        = flag.Duration("gap", globalGap, "minimum spacing between two requests, the edge allows one per second")
+		fInflight   = flag.Int("inflight", maxInflight, "how many requests may wait for an answer at once")
 		fVersion    = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	globalGap = *fGap
+	if globalGap < 100*time.Millisecond {
+		globalGap = 100 * time.Millisecond
+	}
+	maxInflight = *fInflight
+	if maxInflight < 1 {
+		maxInflight = 1
+	}
 
 	if *fVersion {
 		fmt.Printf("sniper %s %s/%s %s\n",
@@ -215,6 +281,9 @@ func run() int {
 	defer tr.Close()
 	ui.tr = tr
 	ui.info("transcript %s", tr.path)
+	tr.write("BUILD    %s %s/%s %s", buildVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
+	tr.write("PACING   gap=%s cooldown=%s inflight=%d rateLimitBackoff=%s parkedBackoff=%s timeout=%s",
+		globalGap, courseCooldown, maxInflight, rateLimitBackoff, parkedBackoff, httpTimeout)
 
 	cl := &client{
 		http:  &http.Client{Timeout: httpTimeout},
@@ -248,12 +317,23 @@ func run() int {
 	ctx, stop := signalContext(ui)
 	defer stop()
 
-	ui.waitUntil(ctx, fireAt)
+	// Stop short of the window so the warm up lands inside its own lead. It
+	// used to run after the wait, which made the lead negative: the warm up
+	// GET then went out at the fire time, the first POST followed it within
+	// milliseconds, and the edge rejected it. Both transcripts from
+	// 2026-09-08 lost their opening shot exactly that way.
+	ui.waitUntil(ctx, fireAt.Add(-warmupLead), fireAt)
 	if ctx.Err() != nil {
 		return report(ui, courses)
 	}
 
 	cl.warmUp(ui, fireAt)
+	if !sleepCtx(ctx, time.Until(fireAt)) {
+		return report(ui, courses)
+	}
+	tr.write("FIRE     planned %s, actually armed %s, %s late",
+		fireAt.Format("15:04:05.000"), time.Now().Format("15:04:05.000"),
+		time.Since(fireAt).Truncate(time.Millisecond))
 	authFailed := fireWindow(ctx, ui, cl, courses)
 	code := report(ui, courses)
 	if authFailed {
@@ -264,81 +344,239 @@ func run() int {
 
 // ---------------------------------------------------------------- scheduling
 
-// fireWindow spends one request token at a time on the highest priority course
-// that is off cooldown, until every course has landed or the run is stopped.
-// fireWindow returns true when it stopped because the token was rejected.
-func fireWindow(ctx context.Context, ui *ui, cl *client, courses []*course) bool {
+// fireWindow spends request tokens until every course has landed or the run
+// is stopped. It returns true when it stopped because the token was rejected.
+//
+// Two rules decide who gets the next token. A course the backend has never
+// judged outranks one it has, so the first pass covers the whole list before
+// anything is retried: under strict priority order on 2026-09-08 the first
+// course absorbed four attempts and thirty seconds while the last two courses
+// never got a single request. Within the same count, list order wins.
+func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) bool {
 	ui.rule("window open, firing")
-	nextGlobal := time.Now()
+
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		authBad  bool
+		inflight int
+		// nextSend is the earliest the next request may leave. The warm up
+		// spends a token like any other request, so start from the last call
+		// the client made rather than from now.
+		nextSend = cl.called().Add(globalGap)
+	)
+	slots := make(chan struct{}, maxInflight)
+	wake := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
 
 	for ctx.Err() == nil {
-		if allDone(courses) {
-			return false
+		mu.Lock()
+		finished, wait := allDone(courses), time.Until(nextSend)
+		mu.Unlock()
+		if finished {
+			break
 		}
-		now := time.Now()
-
-		var pick *course
-		earliest := time.Time{}
-		for _, c := range courses {
-			if c.done {
-				continue
-			}
-			if !c.next.After(now) {
-				pick = c
-				break // courses are already in priority order
-			}
-			if earliest.IsZero() || c.next.Before(earliest) {
-				earliest = c.next
-			}
-		}
-
-		if pick == nil {
-			if !sleepCtx(ctx, time.Until(earliest)) {
-				return false
+		// Loop rather than fall through after sleeping: an answer arriving
+		// meanwhile can land the last course or push the token further out.
+		if wait > 0 {
+			if !sleepCtx(ctx, wait) {
+				break
 			}
 			continue
 		}
-		if wait := time.Until(nextGlobal); wait > 0 {
-			if !sleepCtx(ctx, wait) {
-				return false
-			}
+
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			continue
 		}
 
+		mu.Lock()
+		pick, earliest := choose(courses, time.Now())
+		if pick == nil {
+			ui.tr.write("SCHED    idle, %d in flight, nothing eligible%s", inflight, freeNote(earliest))
+			mu.Unlock()
+			<-slots
+			waitForWake(ctx, wake, earliest)
+			continue
+		}
 		sent := time.Now()
-		nextGlobal = sent.Add(globalGap)
 		pick.attempts++
-		resp, rtt, err := cl.add(pick)
+		pick.pending = true
+		pick.next = sent.Add(courseCooldown)
+		attempt := pick.attempts
+		nextSend = sent.Add(globalGap)
+		inflight++
+		ui.tr.write("SCHED    send %s attempt %d, %d in flight, next token at %s",
+			pick.id, attempt, inflight, nextSend.Format("15:04:05.000"))
+		ui.tr.write("SCHED    board %s", board(courses))
+		mu.Unlock()
 
-		switch {
-		case errors.Is(err, errRateLimited):
-			pick.last = "429"
-			ui.attempt(pick, "429 RATE LIMITED", fmt.Sprintf("backing off %s", rateLimitBackoff), rtt, kindWarn)
-			nextGlobal = sent.Add(rateLimitBackoff)
-			for _, c := range courses {
-				if !c.done && c.next.Before(nextGlobal) {
-					c.next = nextGlobal
+		wg.Add(1)
+		go func(c *course, attempt int, sent time.Time) {
+			defer wg.Done()
+			defer func() { <-slots }()
+
+			resp, rtt, err := cl.add(c)
+			var str *stringResult
+
+			mu.Lock()
+			c.pending = false
+			inflight--
+			switch {
+			case errors.Is(err, errRateLimited):
+				// The edge answered on its own and the backend never saw the
+				// request, so this is not a judgement on the course and it
+				// keeps its place in the queue. Only the shared token moves,
+				// because the limiter is keyed on the IP, not on the course.
+				c.last = "429"
+				c.next = sent
+				if back := time.Now().Add(rateLimitBackoff); back.After(nextSend) {
+					nextSend = back
 				}
+				ui.attempt(c, attempt, "429 RATE LIMITED", fmt.Sprintf("edge rejected it, next token in %s", rateLimitBackoff), rtt, kindWarn)
+			case errors.Is(err, errAuth):
+				authBad = true
+				ui.fatal("token rejected or expired, log in again and rerun")
+				cancel()
+			case errors.As(err, &str):
+				c.judged++
+				applyCode(ui, c, attempt, str.code, rtt)
+			case err != nil:
+				// A request that gave up client side may still have been
+				// carried out: on 2026-09-08 two that timed out registered the
+				// course anyway. Count it as judged so the scheduler moves on
+				// and lets the next answer report what really happened.
+				c.judged++
+				c.last = "error"
+				ui.attempt(c, attempt, "REQUEST FAILED", err.Error()+" (it may still have been carried out)", rtt, kindWarn)
+			default:
+				c.judged++
+				applyJobs(ui, courses, c, attempt, resp, rtt)
+				ui.setRemaining(resp.RemainingActions)
 			}
-		case errors.Is(err, errAuth):
-			ui.fatal("token rejected or expired, log in again and rerun")
-			return true
-		case err != nil:
-			pick.last = "error"
-			pick.next = sent.Add(courseCooldown)
-			ui.attempt(pick, "REQUEST FAILED", err.Error(), rtt, kindWarn)
-		default:
-			pick.next = sent.Add(courseCooldown)
-			applyJobs(ui, courses, pick, resp, rtt)
-			ui.setRemaining(resp.RemainingActions)
+			mu.Unlock()
+			notify()
+		}(pick, attempt, sent)
+	}
+
+	wg.Wait()
+	return authBad
+}
+
+// choose returns the course that should get the next token, and the soonest
+// time some course comes off cooldown when none is eligible right now.
+func choose(courses []*course, now time.Time) (*course, time.Time) {
+	var pick *course
+	var earliest time.Time
+	for _, c := range courses {
+		if c.done || c.pending {
+			continue
+		}
+		if c.next.After(now) {
+			if earliest.IsZero() || c.next.Before(earliest) {
+				earliest = c.next
+			}
+			continue
+		}
+		if pick == nil || betterPick(c, pick) {
+			pick = c
 		}
 	}
-	return false
+	return pick, earliest
+}
+
+// betterPick ranks two eligible courses. A parked course goes last whatever
+// its position, then the one the backend has judged fewer times, then list
+// order, which is the priority the operator gave.
+func betterPick(a, b *course) bool {
+	if a.parked != b.parked {
+		return b.parked
+	}
+	if a.judged != b.judged {
+		return a.judged < b.judged
+	}
+	return a.pri < b.pri
+}
+
+// waitForWake blocks until an answer lands, until a course comes off cooldown,
+// or until the run is stopped. earliest may be zero, which means every course
+// still outstanding has a request in flight and only an answer can help.
+func waitForWake(ctx context.Context, wake <-chan struct{}, earliest time.Time) {
+	if earliest.IsZero() {
+		select {
+		case <-wake:
+		case <-ctx.Done():
+		}
+		return
+	}
+	t := time.NewTimer(time.Until(earliest))
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-wake:
+	case <-ctx.Done():
+	}
+}
+
+func freeNote(earliest time.Time) string {
+	if earliest.IsZero() {
+		return ", waiting on an answer"
+	}
+	return fmt.Sprintf(", next free at %s", earliest.Format("15:04:05.000"))
+}
+
+// board renders every course on one transcript line, so a scheduling decision
+// can be read back against the state it was made from.
+func board(courses []*course) string {
+	var b strings.Builder
+	now := time.Now()
+	for i, c := range courses {
+		if i > 0 {
+			b.WriteString(" | ")
+		}
+		fmt.Fprintf(&b, "%s %s att=%d judged=%d last=%s", c.id, courseState(c, now), c.attempts, c.judged, orDash(c.last))
+		if !c.done && !c.pending && c.next.After(now) {
+			fmt.Fprintf(&b, " free=+%s", c.next.Sub(now).Truncate(time.Millisecond))
+		}
+	}
+	return b.String()
+}
+
+func courseState(c *course, now time.Time) string {
+	switch {
+	case c.done:
+		return "done"
+	case c.pending:
+		return "inflight"
+	case c.parked:
+		return "parked"
+	case c.next.After(now):
+		return "cooling"
+	default:
+		return "ready"
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // applyJobs reads the newest result for the course just attempted, then
 // harvests successes for any other course. jobs is newest first and
 // accumulates across the whole session, so the first match is the latest.
-func applyJobs(ui *ui, courses []*course, pick *course, resp *regResponse, rtt time.Duration) {
+func applyJobs(ui *ui, courses []*course, pick *course, attempt int, resp *regResponse, rtt time.Duration) {
 	seen := map[string]string{}
 	for _, j := range resp.Jobs {
 		if _, ok := seen[j.CourseID]; !ok && j.Result != "" {
@@ -346,20 +584,11 @@ func applyJobs(ui *ui, courses []*course, pick *course, resp *regResponse, rtt t
 		}
 	}
 
-	res, ok := seen[pick.id]
-	switch {
-	case !ok:
+	if res, ok := seen[pick.id]; ok {
+		applyCode(ui, pick, attempt, res, rtt)
+	} else {
 		pick.last = "QUEUED"
-		ui.attempt(pick, "QUEUED", "server has not judged it yet", rtt, kindWarn)
-	case res == resultOK || res == resultDuplicate:
-		land(ui, pick, res, rtt)
-	default:
-		pick.last = res
-		note := fmt.Sprintf("retry at %s", pick.next.Format("15:04:05.000"))
-		if why, bad := permanentFailures[res]; bad {
-			note = why + ", will not succeed on retry"
-		}
-		ui.attempt(pick, res, note, rtt, kindBad)
+		ui.attempt(pick, attempt, "QUEUED", "server has not judged it yet", rtt, kindWarn)
 	}
 
 	// A response describes every job, so another course may have landed
@@ -370,12 +599,40 @@ func applyJobs(ui *ui, courses []*course, pick *course, resp *regResponse, rtt t
 			continue
 		}
 		if r, ok := seen[c.id]; ok && (r == resultOK || r == resultDuplicate) {
-			land(ui, c, r, 0)
+			land(ui, c, c.attempts, r, 0)
 		}
 	}
 }
 
-func land(ui *ui, c *course, res string, rtt time.Duration) {
+// applyCode records one result code against the course it was returned for.
+func applyCode(ui *ui, c *course, attempt int, res string, rtt time.Duration) {
+	if c.done {
+		// The course landed from another response while this request was in
+		// flight. There is nothing left to record, but the transcript should
+		// still show that the answer arrived.
+		ui.tr.write("SCHED    late answer for %s attempt %d: %s, it had already landed", c.id, attempt, res)
+		return
+	}
+	if res == resultOK || res == resultDuplicate {
+		land(ui, c, attempt, res, rtt)
+		return
+	}
+	c.last = res
+	note := fmt.Sprintf("retry at %s", c.next.Format("15:04:05.000"))
+	k := kindBad
+	if why, queued := queuedResults[res]; queued {
+		note = why + ", waiting for its verdict instead of resending"
+		k = kindWarn
+	}
+	if why, bad := permanentFailures[res]; bad {
+		c.parked = true
+		c.next = time.Now().Add(parkedBackoff)
+		note = why + ", parked until " + c.next.Format("15:04:05")
+	}
+	ui.attempt(c, attempt, res, note, rtt, k)
+}
+
+func land(ui *ui, c *course, attempt int, res string, rtt time.Duration) {
 	c.done = true
 	c.landed = time.Now()
 	c.last = res
@@ -388,7 +645,7 @@ func land(ui *ui, c *course, res string, rtt time.Duration) {
 	} else {
 		note += " (seen in another response)"
 	}
-	ui.attempt(c, res, note, rtt, kindGood)
+	ui.attempt(c, attempt, res, note, rtt, kindGood)
 	ui.bell()
 }
 
@@ -421,7 +678,7 @@ func signalContext(ui *ui) (context.Context, func()) {
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-ch
-		ui.warn("stopping, letting the request in flight finish. press Ctrl-C again to force.")
+		ui.warn("stopping, letting the requests in flight finish. press Ctrl-C again to force.")
 		cancel()
 		<-ch
 		ui.warn("forced")
@@ -438,10 +695,45 @@ var (
 )
 
 type client struct {
-	http     *http.Client
-	token    string
-	tr       *transcript
+	http  *http.Client
+	token string
+	tr    *transcript
+
+	mu       sync.Mutex
+	seq      int
 	lastCall time.Time
+}
+
+// stringResult is a bare quoted string body, like
+//
+//	"REPEATED_REQUEST 40111099930004-11add"
+//
+// which is what the portal answers when it declines to queue the job at all.
+// The body carries no jobs array, so there is nothing to harvest from it and
+// the only way to learn the verdict is a later response.
+type stringResult struct {
+	code   string
+	detail string
+}
+
+func (e *stringResult) Error() string {
+	if e.detail == "" {
+		return e.code
+	}
+	return e.code + " " + e.detail
+}
+
+func (c *client) nextSeq() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seq++
+	return c.seq
+}
+
+func (c *client) called() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastCall
 }
 
 func (c *client) add(co *course) (*regResponse, time.Duration, error) {
@@ -464,26 +756,12 @@ func (c *client) post(body regRequest) (*regResponse, time.Duration, error) {
 	req.Header.Set("Referer", portalReferer)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
-	reused := false
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		GotConn: func(i httptrace.GotConnInfo) { reused = i.Reused },
-	}))
+	seq := c.nextSeq()
+	c.tr.write("REQUEST  #%d POST %s %s", seq, regEndpoint, buf)
 
-	c.tr.write("REQUEST  %s", buf)
-	start := time.Now()
-	res, err := c.http.Do(req)
-	rtt := time.Since(start)
-	c.lastCall = time.Now()
+	res, raw, rtt, err := c.do(req, seq)
 	if err != nil {
-		c.tr.write("ERROR    %v", err)
 		return nil, rtt, err
-	}
-	defer res.Body.Close()
-
-	raw, readErr := io.ReadAll(res.Body)
-	c.tr.write("RESPONSE status=%d rtt=%s connReused=%t body=%s", res.StatusCode, rtt, reused, raw)
-	if readErr != nil {
-		return nil, rtt, readErr
 	}
 	if res.StatusCode == http.StatusTooManyRequests {
 		return nil, rtt, errRateLimited
@@ -491,13 +769,29 @@ func (c *client) post(body regRequest) (*regResponse, time.Duration, error) {
 	if len(raw) == 0 {
 		return nil, rtt, fmt.Errorf("empty response body (status %d)", res.StatusCode)
 	}
-	if raw[0] != '{' {
+
+	switch raw[0] {
+	case '{':
+	case '"':
+		var msg string
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return nil, rtt, fmt.Errorf("unreadable string response (status %d): %.60s", res.StatusCode, raw)
+		}
+		code, detail, _ := strings.Cut(msg, " ")
+		return nil, rtt, &stringResult{code: code, detail: detail}
+	default:
 		return nil, rtt, fmt.Errorf("non-JSON response (status %d): %.60s", res.StatusCode, raw)
 	}
 
 	var out regResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, rtt, err
+	}
+	if out.Time > 0 {
+		server := msToTime(out.Time)
+		c.tr.write("CLOCK    #%d server=%s local=%s offset=%s (negative means the local clock is behind)",
+			seq, server.Format("15:04:05.000"), time.Now().Format("15:04:05.000"),
+			time.Since(server).Truncate(time.Millisecond))
 	}
 	// Auth failure arrives as HTTP 200 with an error field, never a 401.
 	if out.Error == resultAuthError {
@@ -509,33 +803,127 @@ func (c *client) post(body regRequest) (*regResponse, time.Duration, error) {
 	return &out, rtt, nil
 }
 
+// do sends one request and writes the whole exchange to the transcript: the
+// status and round trip, the phase timings behind that round trip, every
+// response header, and the body. None of it reaches the terminal. The point is
+// that a run can be taken apart afterwards without guessing, which is how the
+// warm up and the 429s of 2026-09-08 stayed invisible for as long as they did.
+func (c *client) do(req *http.Request, seq int) (*http.Response, []byte, time.Duration, error) {
+	var (
+		reused, dialed          bool
+		writes                  int
+		start                   time.Time
+		dnsAt, connAt, tlsAt    time.Time
+		dns, connect, handshake time.Duration
+		ttfb                    time.Duration
+	)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn:           func(i httptrace.GotConnInfo) { reused = i.Reused },
+		DNSStart:          func(httptrace.DNSStartInfo) { dnsAt = time.Now() },
+		DNSDone:           func(httptrace.DNSDoneInfo) { dns = time.Since(dnsAt) },
+		ConnectStart:      func(string, string) { dialed = true; connAt = time.Now() },
+		ConnectDone:       func(string, string, error) { connect = time.Since(connAt) },
+		TLSHandshakeStart: func() { tlsAt = time.Now() },
+		TLSHandshakeDone:  func(tls.ConnectionState, error) { handshake = time.Since(tlsAt) },
+		// More than one write means net/http replayed the request on a fresh
+		// connection, which for an add would queue the job twice.
+		WroteRequest:         func(httptrace.WroteRequestInfo) { writes++ },
+		GotFirstResponseByte: func() { ttfb = time.Since(start) },
+	}))
+
+	start = time.Now()
+	res, err := c.http.Do(req)
+	rtt := time.Since(start)
+
+	c.mu.Lock()
+	c.lastCall = time.Now()
+	c.mu.Unlock()
+
+	if err != nil {
+		c.tr.write("ERROR    #%d after %s: %v", seq, rtt.Truncate(time.Millisecond), err)
+		c.tr.write("TIMING   #%d reused=%t dialed=%t dns=%s connect=%s tls=%s ttfb=%s writes=%d",
+			seq, reused, dialed, dns.Truncate(time.Millisecond), connect.Truncate(time.Millisecond),
+			handshake.Truncate(time.Millisecond), ttfb.Truncate(time.Millisecond), writes)
+		return nil, nil, rtt, err
+	}
+	defer res.Body.Close()
+	raw, readErr := io.ReadAll(res.Body)
+
+	c.tr.write("RESPONSE #%d status=%d rtt=%s proto=%s bytes=%d", seq, res.StatusCode, rtt, res.Proto, len(raw))
+	c.tr.write("TIMING   #%d reused=%t dialed=%t dns=%s connect=%s tls=%s ttfb=%s writes=%d",
+		seq, reused, dialed, dns.Truncate(time.Millisecond), connect.Truncate(time.Millisecond),
+		handshake.Truncate(time.Millisecond), ttfb.Truncate(time.Millisecond), writes)
+	c.tr.write("HEADERS  #%d %s", seq, headerLine(res.Header))
+	c.tr.write("BODY     #%d %s", seq, clip(raw, 32<<10))
+	if writes > 1 {
+		c.tr.write("WARNING  #%d the request was written %d times, so the job may have been queued more than once", seq, writes)
+	}
+	if readErr != nil {
+		return res, nil, rtt, readErr
+	}
+	return res, raw, rtt, nil
+}
+
+// headerLine renders the response headers in a stable order on one line. The
+// interesting ones are retry-after and x-ratelimit-*, which the edge is not
+// documented to send but which cost nothing to record in case it starts.
+func headerLine(h http.Header) string {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		v := strings.Join(h[k], ", ")
+		if strings.EqualFold(k, "Set-Cookie") {
+			v = fmt.Sprintf("<%d bytes>", len(v))
+		}
+		fmt.Fprintf(&b, "%s=%q", strings.ToLower(k), v)
+	}
+	return b.String()
+}
+
+func clip(raw []byte, n int) string {
+	if len(raw) <= n {
+		return string(raw)
+	}
+	return fmt.Sprintf("%s... (%d bytes total)", raw[:n], len(raw))
+}
+
 // warmUp opens a connection shortly before the window so the first real
-// request does not pay a TLS handshake, which measured about 650ms. The
-// GET spends a rate limit token, so it must not run inside the last second.
+// request does not pay a TLS handshake, which measured about 650ms. The GET
+// spends a rate limit token like any other request to the host, so it has to
+// finish a full gap before the window rather than inside it.
 func (c *client) warmUp(ui *ui, fireAt time.Time) {
-	if time.Since(c.lastCall) < warmupSkipIfNewerThan {
-		ui.info("warm up  skipped, connection pooled %s ago", time.Since(c.lastCall).Truncate(time.Second))
+	if since := time.Since(c.called()); since < warmupSkipIfNewerThan {
+		ui.info("warm up  skipped, connection pooled %s ago", since.Truncate(time.Second))
+		c.tr.write("WARMUP   skipped, last call %s ago", since.Truncate(time.Millisecond))
 		return
 	}
-	lead := time.Until(fireAt) - warmupLead
-	if lead > 0 {
+	if lead := time.Until(fireAt) - warmupLead; lead > 0 {
 		time.Sleep(lead)
 	}
 	req, err := http.NewRequest(http.MethodGet, portalOrigin+"/", nil)
 	if err != nil {
 		return
 	}
+	seq := c.nextSeq()
+	c.tr.write("WARMUP   #%d GET %s/ at %s, %s before the window",
+		seq, portalOrigin, time.Now().Format("15:04:05.000"), time.Until(fireAt).Truncate(time.Millisecond))
 	start := time.Now()
-	res, err := c.http.Do(req)
-	c.lastCall = time.Now()
-	if err != nil {
+	if _, _, _, err := c.do(req, seq); err != nil {
 		ui.warn("warm up failed: %v", err)
 		return
 	}
-	io.Copy(io.Discard, res.Body)
-	res.Body.Close()
-	ui.info("warm up  connection opened in %dms, %s before the window",
-		time.Since(start).Milliseconds(), time.Until(fireAt).Truncate(time.Millisecond))
+	left := time.Until(fireAt).Truncate(time.Millisecond)
+	ui.info("warm up  connection opened in %dms, %s before the window", time.Since(start).Milliseconds(), left)
+	if left < globalGap {
+		ui.warn("warm up  it ate into the first token, the opening request may be rejected")
+	}
 }
 
 // ---------------------------------------------------------------- clock sync
@@ -828,7 +1216,7 @@ func parseCourses(cat map[string]catalogueEntry, specs []string) ([]*course, err
 			}
 			units = override
 		}
-		out = append(out, &course{id: id, units: units, title: entry.Title})
+		out = append(out, &course{id: id, units: units, title: entry.Title, pri: len(out)})
 	}
 	if len(out) == 0 {
 		return nil, errors.New("no courses given")
@@ -845,11 +1233,11 @@ func confirm(ui *ui, courses []*course, s *clockSync, target, fireAt time.Time, 
 	}
 	ui.plain("     %s, %s total", plural(len(courses), "course"), plural(int(total), "unit"))
 	if s.remaining > 0 {
-		ui.plain("     %d registration actions remaining", s.remaining)
+		ui.plain("     %d remove or group change actions remaining", s.remaining)
 	}
 	ui.plain("  window opens  %s", target.Format("2006-01-02 15:04:05.000"))
 	ui.plain("  firing at     %s (in %s)", fireAt.Format("15:04:05.000"), time.Until(fireAt).Truncate(time.Millisecond))
-	ui.plain("  pacing        one request every %s, %s per course", globalGap, courseCooldown)
+	ui.plain("  pacing        one request every %s, %s per course, up to %d in flight", globalGap, courseCooldown, maxInflight)
 	if yes {
 		return true
 	}
@@ -870,8 +1258,8 @@ func report(ui *ui, courses []*course) int {
 	outstanding := 0
 	for _, c := range courses {
 		if c.done {
-			ui.good("  registered   %-9s %-30s at %s after %d attempt(s)",
-				c.id, trimTitle(c.title, 30), c.landed.Format("15:04:05.000"), c.attempts)
+			ui.good("  registered   %-9s %-30s at %s after %s",
+				c.id, trimTitle(c.title, 30), c.landed.Format("15:04:05.000"), plural(c.attempts, "attempt"))
 			continue
 		}
 		outstanding++
@@ -879,9 +1267,10 @@ func report(ui *ui, courses []*course) int {
 		if last == "" {
 			last = "no attempt"
 		}
-		ui.bad("  outstanding  %-9s %-30s %d attempt(s), last %s",
-			c.id, trimTitle(c.title, 30), c.attempts, last)
+		ui.bad("  outstanding  %-9s %-30s %s, last %s",
+			c.id, trimTitle(c.title, 30), plural(c.attempts, "attempt"), last)
 	}
+	ui.tr.write("BOARD    %s", board(courses))
 	if outstanding == 0 {
 		ui.good("  everything landed")
 		return 0
@@ -892,6 +1281,7 @@ func report(ui *ui, courses []*course) int {
 // ---------------------------------------------------------------- transcript
 
 type transcript struct {
+	mu   sync.Mutex
 	f    *os.File
 	path string
 }
@@ -913,7 +1303,10 @@ func (t *transcript) write(format string, args ...any) {
 	if t == nil || t.f == nil {
 		return
 	}
-	fmt.Fprintf(t.f, "%s %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
+	line := fmt.Sprintf(format, args...)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	fmt.Fprintf(t.f, "%s %s\n", time.Now().Format("15:04:05.000"), line)
 }
 
 func (t *transcript) Close() error {
@@ -921,6 +1314,8 @@ func (t *transcript) Close() error {
 		return nil
 	}
 	t.write("SESSION  ended")
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.f.Close()
 }
 
@@ -1022,18 +1417,22 @@ func (u *ui) bell() {
 }
 
 func (u *ui) setRemaining(n int) {
-	if n != 0 && n != u.remaining {
-		if u.remaining != 0 {
-			u.info("registration actions remaining: %d", n)
-		}
-		u.remaining = n
+	if n == 0 || n == u.remaining {
+		return
 	}
+	if u.remaining != 0 {
+		u.info("remove or group change actions remaining: %d", n)
+	}
+	u.remaining = n
 }
 
 // attempt prints one attempt line:
 //
 //	16:00:00.412  #1  22034-2  OK  -> registered in 412ms
-func (u *ui) attempt(c *course, result, note string, rtt time.Duration, k kind) {
+//
+// n is the attempt this line reports, which is not always the course's current
+// count now that several requests can be in flight at once.
+func (u *ui) attempt(c *course, n int, result, note string, rtt time.Duration, k kind) {
 	col := cDim
 	switch k {
 	case kindGood:
@@ -1045,7 +1444,7 @@ func (u *ui) attempt(c *course, result, note string, rtt time.Duration, k kind) 
 	}
 	line := fmt.Sprintf("%s  %s  %-9s  %s -> %s",
 		u.paint(cDim, stamp()),
-		u.paint(cDim, fmt.Sprintf("#%d", c.attempts)),
+		u.paint(cDim, fmt.Sprintf("#%d", n)),
 		c.id,
 		u.paint(col, fmt.Sprintf("%-19s", result)),
 		note)
@@ -1085,8 +1484,10 @@ func (u *ui) showFireTime(s *clockSync, target, fireAt time.Time) {
 }
 
 // waitUntil logs a heartbeat that tightens as the window approaches, then
-// counts down the final minute one line per second.
-func (u *ui) waitUntil(ctx context.Context, fireAt time.Time) {
+// counts down the final minute one line per second. It returns at until, which
+// is where the warm up goes, while the countdown it prints is always the time
+// left to fireAt.
+func (u *ui) waitUntil(ctx context.Context, until, fireAt time.Time) {
 	d := time.Until(fireAt)
 	if d <= 0 {
 		u.warn("the window opened %s ago, firing immediately", (-d).Truncate(time.Second))
@@ -1097,6 +1498,9 @@ func (u *ui) waitUntil(ctx context.Context, fireAt time.Time) {
 	u.info("press Ctrl-C to abort")
 
 	for {
+		if !time.Now().Before(until) {
+			return
+		}
 		rem := time.Until(fireAt)
 		if rem <= 0 {
 			return
