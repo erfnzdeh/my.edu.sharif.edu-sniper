@@ -38,6 +38,17 @@ course took nine attempts and roughly twenty eight seconds of scheduler time
 under the old rule. Permanent failures are called out in the log with a plain
 explanation so they are obvious at a glance.
 
+Two groups in the third column get special handling. The timing codes,
+`NO_REGISTRATION_TIME`, `REGISTRATION_TIME_LIMIT`, `NOT_LOGIN_TIME`,
+`LOGIN_TIME_RESTRICTION`, `EDU_TIME` and `CLOSED_INTERVAL`, mean the backend
+refused to look at the course, so they are not counted as verdicts and the
+course keeps its place in the order. `TOO_MANY_REQUESTS`, `PLEASE_WAIT` and
+`BLOCKED` are the portal pushing back on the client as a whole, so they hold
+the shared request token the way a `429` does, for 2 seconds, or 30 seconds
+for `BLOCKED`, whose own text says minutes and which follows the student id
+rather than the connection. An `error` field on an object body is read as a
+result code the same way a bare string body is.
+
 ---
 
 ## Full reference

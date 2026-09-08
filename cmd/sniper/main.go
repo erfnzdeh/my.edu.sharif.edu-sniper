@@ -52,6 +52,10 @@ const (
 	// freeze costs far more than the rejection did: on 2026-09-08 two 429s
 	// cost fourteen seconds of the most contested part of the window.
 	rateLimitBackoff = 2 * time.Second
+	// How long to hold every request after the portal reports BLOCKED. Its
+	// own text says minutes, and the block follows the student id rather than
+	// the connection, so there is nothing to gain by probing sooner.
+	blockedBackoff = 30 * time.Second
 	// How long to hold back a course whose result cannot change on a retry.
 	// It is still retried, because the operator may drop the course it
 	// clashes with, but it must not crowd out a course that can still land.
@@ -136,6 +140,30 @@ var permanentFailures = map[string]string{
 var queuedResults = map[string]string{
 	"REPEATED_REQUEST": "the portal already has this exact job queued",
 	"ALREADY_IN_QUEUE": "a job for this course is already queued",
+}
+
+// timingResults mean the backend refused to look at the course at all, so
+// they are not verdicts on it and do not count against it in the ordering.
+var timingResults = map[string]string{
+	"NO_REGISTRATION_TIME":    "registration is not open",
+	"REGISTRATION_TIME_LIMIT": "not your registration slot",
+	"NOT_LOGIN_TIME":          "not your registration slot",
+	"LOGIN_TIME_RESTRICTION":  "not your login window",
+	"EDU_TIME":                "the portal is only live 08:00 to 12:00",
+	"CLOSED_INTERVAL":         "the portal is closed at this hour",
+}
+
+// holdResults are the portal pushing back on the client as a whole rather
+// than judging a course, so they hold the shared token the way a 429 does.
+// None has been seen live. BLOCKED says "try again in a few minutes", and it
+// is keyed on the student id, so hammering through it can only prolong it.
+var holdResults = map[string]struct {
+	why  string
+	hold time.Duration
+}{
+	"TOO_MANY_REQUESTS": {"too many requests outstanding, lower -inflight if this repeats", rateLimitBackoff},
+	"PLEASE_WAIT":       {"the portal's upstream is struggling", rateLimitBackoff},
+	"BLOCKED":           {"your student id is restricted for excess requests", blockedBackoff},
 }
 
 type catalogueEntry struct {
@@ -396,6 +424,12 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 
 	for ctx.Err() == nil {
 		mu.Lock()
+		// The client records when each request was actually written, which
+		// is later than the scheduler's send time on a cold connection, and
+		// the warm up writes a request the scheduler never sent at all.
+		if ns := cl.called().Add(globalGap); ns.After(nextSend) {
+			nextSend = ns
+		}
 		finished, wait := allDone(courses), time.Until(nextSend)
 		mu.Unlock()
 		if finished {
@@ -464,8 +498,18 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 				authBad = true
 				ui.fatal("token rejected or expired, log in again and rerun")
 				cancel()
+			case errors.As(err, &str) && holdResults[str.code].hold > 0:
+				// The portal is pushing back on the client as a whole, not on
+				// this course, so hold the shared token and let the course
+				// keep its place, exactly as for a 429.
+				h := holdResults[str.code]
+				c.last = str.code
+				c.next = sent
+				if back := time.Now().Add(h.hold); back.After(nextSend) {
+					nextSend = back
+				}
+				ui.attempt(c, attempt, str.code, fmt.Sprintf("%s, next token in %s", h.why, h.hold), rtt, kindWarn)
 			case errors.As(err, &str):
-				c.judged++
 				applyCode(ui, c, attempt, str.code, rtt)
 			case err != nil:
 				// A request that gave up client side may still have been
@@ -476,7 +520,6 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 				c.last = "error"
 				ui.attempt(c, attempt, "REQUEST FAILED", err.Error()+" (it may still have been carried out)", rtt, kindWarn)
 			default:
-				c.judged++
 				applyJobs(ui, courses, c, attempt, resp, rtt)
 				ui.setRemaining(resp.RemainingActions)
 			}
@@ -611,16 +654,22 @@ func orDash(s string) string {
 // harvests successes for any other course. jobs is newest first and
 // accumulates across the whole session, so the first match is the latest.
 func applyJobs(ui *ui, courses []*course, pick *course, attempt int, resp *regResponse, rtt time.Duration) {
+	// The newest job per course, judged or not. Skipping an unjudged job
+	// would fall through to an older one: on 2026-09-08 that read a pre
+	// window NO_REGISTRATION_TIME as the verdict on a course whose real job
+	// was still queued. Had the stale result been a permanent failure the
+	// course would have been parked for nothing.
 	seen := map[string]string{}
 	for _, j := range resp.Jobs {
-		if _, ok := seen[j.CourseID]; !ok && j.Result != "" {
+		if _, ok := seen[j.CourseID]; !ok {
 			seen[j.CourseID] = j.Result
 		}
 	}
 
-	if res, ok := seen[pick.id]; ok {
+	if res, ok := seen[pick.id]; ok && res != "" {
 		applyCode(ui, pick, attempt, res, rtt)
-	} else {
+	} else if !pick.done {
+		pick.judged++
 		pick.last = "QUEUED"
 		ui.attempt(pick, attempt, "QUEUED", "server has not judged it yet", rtt, kindWarn)
 	}
@@ -654,6 +703,15 @@ func applyCode(ui *ui, c *course, attempt int, res string, rtt time.Duration) {
 	c.last = res
 	note := fmt.Sprintf("retry at %s", c.next.Format("15:04:05.000"))
 	k := kindBad
+	if why, timing := timingResults[res]; timing {
+		// The backend refused to look at the course, so this is not a verdict
+		// on it. It keeps its rank rather than falling behind every course
+		// tried after it, which matters most for the first course on the list
+		// when the opening request lands a moment early.
+		ui.attempt(c, attempt, res, why+", keeps its place", rtt, kindWarn)
+		return
+	}
+	c.judged++
 	if why, queued := queuedResults[res]; queued {
 		note = why + ", waiting for its verdict instead of resending"
 		k = kindWarn
@@ -738,13 +796,14 @@ type client struct {
 	lastCall time.Time
 }
 
-// stringResult is a bare quoted string body, like
+// stringResult is a result code that arrived without a jobs array: either a
+// bare quoted string body, like
 //
 //	"REPEATED_REQUEST 40111099930004-11add"
 //
-// which is what the portal answers when it declines to queue the job at all.
-// The body carries no jobs array, so there is nothing to harvest from it and
-// the only way to learn the verdict is a later response.
+// which is what the portal answers when it declines to queue the job at all,
+// or the error field of an object. There is nothing to harvest from either,
+// and the only way to learn a queued job's verdict is a later response.
 type stringResult struct {
 	code   string
 	detail string
@@ -832,7 +891,9 @@ func (c *client) post(body regRequest) (*regResponse, time.Duration, error) {
 		return nil, rtt, errAuth
 	}
 	if out.Error != "" {
-		return nil, rtt, fmt.Errorf("%s", out.Error)
+		// An error field is a result code too, BLOCKED or NO_REMAINED_ACTION
+		// for instance, so it takes the same path as a bare string body.
+		return nil, rtt, &stringResult{code: out.Error}
 	}
 	return &out, rtt, nil
 }
@@ -860,18 +921,21 @@ func (c *client) do(req *http.Request, seq int) (*http.Response, []byte, time.Du
 		TLSHandshakeStart: func() { tlsAt = time.Now() },
 		TLSHandshakeDone:  func(tls.ConnectionState, error) { handshake = time.Since(tlsAt) },
 		// More than one write means net/http replayed the request on a fresh
-		// connection, which for an add would queue the job twice.
-		WroteRequest:         func(httptrace.WroteRequestInfo) { writes++ },
+		// connection, which for an add would queue the job twice. The write
+		// is also the moment the edge starts counting, so it is what the
+		// token is measured from.
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			writes++
+			c.mu.Lock()
+			c.lastCall = time.Now()
+			c.mu.Unlock()
+		},
 		GotFirstResponseByte: func() { ttfb = time.Since(start) },
 	}))
 
 	start = time.Now()
 	res, err := c.http.Do(req)
 	rtt := time.Since(start)
-
-	c.mu.Lock()
-	c.lastCall = time.Now()
-	c.mu.Unlock()
 
 	if err != nil {
 		c.tr.write("ERROR    #%d after %s: %v", seq, rtt.Truncate(time.Millisecond), err)
@@ -931,7 +995,13 @@ func clip(raw []byte, n int) string {
 // warmUp opens a connection shortly before the window so the first real
 // request does not pay a TLS handshake, which measured about 650ms. The GET
 // spends a rate limit token like any other request to the host, so it has to
-// finish a full gap before the window rather than inside it.
+// go out a full gap before the window rather than inside it.
+//
+// It does not wait for the answer. The token is spent when the request is
+// written, and a GET that is slow to come back must not hold the window: the
+// portal speaks HTTP/2, so the connection carries the first POST while the GET
+// is still outstanding, and if the connection never came up the first POST
+// dials one, which is all it would have done without a warm up.
 func (c *client) warmUp(ui *ui, fireAt time.Time) {
 	if since := time.Since(c.called()); since < warmupSkipIfNewerThan {
 		ui.info("warm up  skipped, connection pooled %s ago", since.Truncate(time.Second))
@@ -949,15 +1019,23 @@ func (c *client) warmUp(ui *ui, fireAt time.Time) {
 	c.tr.write("WARMUP   #%d GET %s/ at %s, %s before the window",
 		seq, portalOrigin, time.Now().Format("15:04:05.000"), time.Until(fireAt).Truncate(time.Millisecond))
 	start := time.Now()
-	if _, _, _, err := c.do(req, seq); err != nil {
-		ui.warn("warm up failed: %v", err)
-		return
-	}
-	left := time.Until(fireAt).Truncate(time.Millisecond)
-	ui.info("warm up  connection opened in %dms, %s before the window", time.Since(start).Milliseconds(), left)
-	if left < globalGap {
-		ui.warn("warm up  it ate into the first token, the opening request may be rejected")
-	}
+	// Count the token from now, in case the request is never written. The
+	// trace moves it to the actual write once that happens.
+	c.mu.Lock()
+	c.lastCall = start
+	c.mu.Unlock()
+	go func() {
+		if _, _, _, err := c.do(req, seq); err != nil {
+			ui.warn("warm up failed: %v, the first request will open its own connection", err)
+			return
+		}
+		took := time.Since(start).Milliseconds()
+		if left := time.Until(fireAt); left > 0 {
+			ui.info("warm up  connection opened in %dms, %s before the window", took, left.Truncate(time.Millisecond))
+		} else {
+			ui.warn("warm up  answered in %dms, %s after the window opened", took, (-left).Truncate(time.Millisecond))
+		}
+	}()
 }
 
 // ---------------------------------------------------------------- clock sync
@@ -997,11 +1075,19 @@ func (c *client) syncClock(co *course) (*clockSync, error) {
 	return s, nil
 }
 
-// fireTime keeps the formula the original script has always used. The margin
-// is deliberately biased late: arriving early is rejected and costs a full
-// cooldown, while arriving late costs only the delay itself.
+// fireTime is when the first request leaves. The server stamps its clock as
+// it answers, so at recv the server is already half a round trip past that
+// stamp, and the request spends the other half on the way in: sending at
+// recv + (window - server) lands a whole network round trip after the window
+// opens. The 100ms on top keeps it late through clock granularity and any
+// asymmetry, because arriving early is rejected while arriving late costs
+// only the delay itself.
+//
+// The formula used to add the probe's round trip as well, and the probe runs
+// on a cold connection, so that included a TLS handshake: one run on
+// 2026-09-08 fired 1.2s after the window for nothing.
 func (s *clockSync) fireTime(target time.Time) time.Time {
-	delay := target.Sub(s.server) + s.rtt + 100*time.Millisecond
+	delay := target.Sub(s.server) + 100*time.Millisecond
 	return s.recv.Add(delay)
 }
 
@@ -1509,9 +1595,11 @@ func (u *ui) showClockSync(s *clockSync) {
 func (u *ui) showFireTime(s *clockSync, target, fireAt time.Time) {
 	gap := target.Sub(s.server)
 	u.plain("")
-	u.plain("  fire = received + (window - serverClock) + roundTrip + 100ms")
-	u.plain("       = %s + %s + %s + 100ms",
-		s.recv.Format("15:04:05.000"), gap.Truncate(time.Millisecond), s.rtt.Truncate(time.Millisecond))
+	u.plain("  fire = received + (window - serverClock) + 100ms")
+	u.plain("       = %s + %s + 100ms",
+		s.recv.Format("15:04:05.000"), gap.Truncate(time.Millisecond))
+	u.plain("  %s", u.paint(cDim, fmt.Sprintf("the request lands a network round trip after that, about %s here",
+		s.rtt.Truncate(time.Millisecond))))
 	u.plain("       = %s", u.paint(cBold, fireAt.Format("15:04:05.000")))
 	u.plain("  %s", u.paint(cDim, "the margin is biased late on purpose: arriving early is rejected"))
 	u.plain("  %s", u.paint(cDim, "and costs a full cooldown, arriving late costs only the delay"))

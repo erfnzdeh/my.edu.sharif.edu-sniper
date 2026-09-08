@@ -41,6 +41,20 @@ Both of run B's timeouts had in fact registered the course. A request that
 gives up client side may still have been carried out, so the answer to a
 timeout is to let the next response tell you, not to resend.
 
+Run B also took a second `429` at 08:00:35, a full 5 seconds after its previous
+request and in the same millisecond as the answer to it. Nothing the sniper
+sent explains that. The limiter is keyed on the IP, so the traffic came from
+alongside it: a click in the browser, or another student behind the same NAT.
+The scheduler now treats a `429` as a 2 second hold on the shared token with
+the course keeping its place, which is the right response either way, but a
+browser tab on the portal during the window is a cost you can avoid.
+
+Both runs also got `REPEATED_REQUEST` on a course that then landed from a job
+the sniper had not knowingly queued. The job ids sit where a request sent a
+second or two before the sniper's would sit, which again points at a click in
+the browser, and it is why `REPEATED_REQUEST` is now read as "the portal has
+it" rather than as a failure.
+
 ---
 
 ## 1. The edge limiter on `/api/reg`
