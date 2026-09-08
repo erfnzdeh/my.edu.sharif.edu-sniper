@@ -41,8 +41,12 @@ explanation so they are obvious at a glance.
 Two groups in the third column get special handling. The timing codes,
 `NO_REGISTRATION_TIME`, `REGISTRATION_TIME_LIMIT`, `NOT_LOGIN_TIME`,
 `LOGIN_TIME_RESTRICTION`, `EDU_TIME` and `CLOSED_INTERVAL`, mean the backend
-refused to look at the course, so they are not counted as verdicts and the
-course keeps its place in the order. `TOO_MANY_REQUESTS`, `PLEASE_WAIT` and
+refused to look at the course. The first one a course gets is not counted as a
+verdict, so an opening request that lands a moment early does not push the
+most contested course to the back of the list. Any further one counts like
+any other retryable result, otherwise a course the portal keeps refusing on
+timing grounds would outrank every course with a real verdict for the rest of
+the run. `TOO_MANY_REQUESTS`, `PLEASE_WAIT` and
 `BLOCKED` are the portal pushing back on the client as a whole, so they hold
 the shared request token the way a `429` does, for 2 seconds, or 30 seconds
 for `BLOCKED`, whose own text says minutes and which follows the student id

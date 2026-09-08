@@ -1,8 +1,9 @@
 // Command sniper registers courses on my.edu.sharif.edu the moment the
 // registration window opens.
 //
-// The portal's edge allows exactly one request per second with no burst, so
-// the scheduler spends one request token at a time. Every course gets its
+// The portal's edge rejects a request that follows the previous one too
+// closely, and everything measured so far fits about one per second with no
+// burst, so the scheduler spends one request token at a time. Every course gets its
 // first attempt before any course gets its second, and within the same
 // attempt count list order is priority order. Answers take seconds to come
 // back, so a few requests may be waiting at once: the token spacing is what
@@ -75,10 +76,11 @@ const (
 // Pacing, overridable from the command line because the right values depend
 // on the link and both cost something when they are wrong.
 var (
-	// globalGap is the minimum spacing between two requests. The edge allows
-	// one per second and counts every request to the host, including the warm
-	// up. A 1.1s gap loses about one request in seven to round trip jitter,
-	// which is a bad trade now that a rejection is cheap but not free.
+	// globalGap is the minimum spacing between two requests. The edge looks
+	// like about one per second, and counts every request to the host,
+	// including the warm up. A 1.1s gap lost about one request in seven to
+	// round trip jitter, which is a bad trade now that a rejection is cheap
+	// but not free. A working default from small samples, hence the flag.
 	// See docs/reference/rate-limits.md.
 	globalGap = 1300 * time.Millisecond
 	// maxInflight caps how many requests may be waiting for an answer at
@@ -208,6 +210,7 @@ type course struct {
 	next     time.Time // not eligible to be retried before this
 	pending  bool      // a request is in flight right now
 	parked   bool      // last result cannot change on a retry
+	early    int       // timing rejections so far, only the first is free
 	done     bool
 	landed   time.Time
 	last     string // most recent result seen
@@ -266,7 +269,7 @@ func run() int {
 		fYes        = flag.Bool("y", false, "skip the confirmation prompt, requires -token and -courses")
 		fCatalogue  = flag.String("catalogue", "", "path or URL of courses.json, overrides the default lookup")
 		fTranscript = flag.String("transcript", "", "transcript file path, defaults to snipe-<timestamp>.log")
-		fGap        = flag.Duration("gap", globalGap, "minimum spacing between two requests, the edge allows one per second")
+		fGap        = flag.Duration("gap", globalGap, "minimum spacing between two requests, the edge allows about one per second")
 		fInflight   = flag.Int("inflight", maxInflight, "cap on requests waiting for an answer at once, 0 for no cap")
 		fVersion    = flag.Bool("version", false, "print the version and exit")
 	)
@@ -324,9 +327,10 @@ func run() int {
 	// The default transport keeps two idle connections per host, so with
 	// answers overlapping, the third concurrent request onwards would find an
 	// empty pool and pay a fresh TLS handshake, measured at about 650ms, every
-	// time it went out. Keep one warm connection per course instead. If the
-	// portal speaks HTTP/2 this is moot, since one connection carries them
-	// all: the transcript's proto= field says which happened.
+	// time it went out. Keep one warm connection per course instead. The
+	// portal negotiates HTTP/2, checked on 2026-09-08, so one connection
+	// carries them all and this only matters on a fallback to HTTP/1.1: the
+	// transcript's proto= field says which happened.
 	pool := http.DefaultTransport.(*http.Transport).Clone()
 	pool.MaxIdleConns = 4 * len(courses)
 	pool.MaxIdleConnsPerHost = 2 * len(courses)
@@ -704,12 +708,20 @@ func applyCode(ui *ui, c *course, attempt int, res string, rtt time.Duration) {
 	note := fmt.Sprintf("retry at %s", c.next.Format("15:04:05.000"))
 	k := kindBad
 	if why, timing := timingResults[res]; timing {
-		// The backend refused to look at the course, so this is not a verdict
-		// on it. It keeps its rank rather than falling behind every course
-		// tried after it, which matters most for the first course on the list
-		// when the opening request lands a moment early.
-		ui.attempt(c, attempt, res, why+", keeps its place", rtt, kindWarn)
-		return
+		c.early++
+		if c.early == 1 {
+			// The backend refused to look at the course, so this is not a
+			// verdict on it. It keeps its rank rather than falling behind
+			// every course tried after it, which matters most for the first
+			// course on the list when the opening request lands a moment
+			// early. Only the first one is free: a course the portal keeps
+			// refusing on timing grounds while the others get real verdicts
+			// would otherwise sit at judged 0 and outrank all of them for
+			// the rest of the run.
+			ui.attempt(c, attempt, res, why+", keeps its place", rtt, kindWarn)
+			return
+		}
+		note = why + ", " + note
 	}
 	c.judged++
 	if why, queued := queuedResults[res]; queued {

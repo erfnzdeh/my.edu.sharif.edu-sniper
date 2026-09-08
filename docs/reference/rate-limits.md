@@ -41,9 +41,18 @@ Both of run B's timeouts had in fact registered the course. A request that
 gives up client side may still have been carried out, so the answer to a
 timeout is to let the next response tell you, not to resend.
 
+Run A's rejections look inconsistent at first: a request sent 1.101s after the
+previous one was rejected and one sent 1.102s after was accepted. The
+difference is the connection. The request before the rejected one went out on
+a fresh connection and paid a TLS handshake inside its 818ms round trip, so it
+reached the edge several hundred milliseconds after the scheduler sent it and
+the next request followed it there well under a second later. The accepted
+pair were both on a warm connection. Spacing has to be measured from when the
+request is written, which is what the client now does.
+
 Run B also took a second `429` at 08:00:35, a full 5 seconds after its previous
 request and in the same millisecond as the answer to it. Nothing the sniper
-sent explains that. The limiter is keyed on the IP, so the traffic came from
+sent explains that, and it is the one observation no per client model covers. The limiter is keyed on the IP, so the traffic came from
 alongside it: a click in the browser, or another student behind the same NAT.
 The scheduler now treats a `429` as a 2 second hold on the shared token with
 the course keeping its place, which is the right response either way, but a
@@ -83,11 +92,15 @@ that matter.
 | **1.10s** | **12 / 14** | the gap `globalGap` currently uses |
 | 1.30s | 14 / 14 | clean across the whole run |
 
-The underlying limit really is one request per second, as the README says. The
-losses at 1.05s and 1.10s are not a different limit, they are jitter: measured
-round trip time on the same pooled connection ranged from 46ms to 2037ms in a
-single run, so a client gap of 1.10s regularly lands two requests less than a
-second apart at the edge.
+Everything here fits a limit of about one request per second, counted when
+the request arrives at the edge, with the losses at 1.05s and 1.10s being
+jitter: measured round trip time on the same pooled connection ranged from
+46ms to 2037ms in a single run, so a client gap of 1.10s can land two requests
+less than a second apart at the edge. But fitting is not proving. The samples
+are small, 1.2s and 1.5s both passed 10 of 12 where a hard threshold would
+show a step, and 12 of 14 against 14 of 14 is not a significant difference on
+its own. Treat "one per second" as the working model and 1.3s as the working
+default, not as a measured rule.
 
 ### Consequence for `globalGap`
 
