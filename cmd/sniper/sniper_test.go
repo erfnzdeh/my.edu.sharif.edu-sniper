@@ -139,7 +139,7 @@ func TestFireWindowLandsEveryCourseWhileAnswersAreSlow(t *testing.T) {
 
 	defer swap(&regEndpoint, srv.URL)()
 	defer swap(&globalGap, 40*time.Millisecond)()
-	defer swap(&maxInflight, 3)()
+	defer swap(&maxInflight, 3)() // pinned, this test is about the cap holding
 
 	courses := mkCourses("a", "b", "c", "d", "e", "f")
 	cl := &client{http: &http.Client{Timeout: 5 * time.Second}}
@@ -158,13 +158,14 @@ func TestFireWindowLandsEveryCourseWhileAnswersAreSlow(t *testing.T) {
 			t.Errorf("%s never landed", c.id)
 		}
 	}
-	// Serially this is six courses times a 300ms answer. Overlapping them has
-	// to beat that clearly, or the concurrency is not doing anything.
+	// The structural check is the real one: requests have to overlap at all.
 	if p.maxAtOnce < 2 {
 		t.Errorf("never had more than %d request in flight, requests are not overlapping", p.maxAtOnce)
 	}
-	if took > 1500*time.Millisecond {
-		t.Errorf("took %s, want well under the 1.8s a serial run would need", took)
+	// The timing check is bounded by what a serial run would cost rather than
+	// by a fixed number, so a loaded machine cannot fail it on its own.
+	if serial := time.Duration(len(courses)) * p.delay; took >= serial {
+		t.Errorf("took %s, a serial run would have been %s, so nothing was gained", took, serial)
 	}
 	if p.maxAtOnce > maxInflight {
 		t.Errorf("%d requests were in flight at once, the cap is %d", p.maxAtOnce, maxInflight)
@@ -174,6 +175,76 @@ func TestFireWindowLandsEveryCourseWhileAnswersAreSlow(t *testing.T) {
 
 // TestFireWindowKeepsTheGapWhenAnswersAreInstant guards the case the edge
 // actually rejects: two requests less than a token apart.
+// TestFireWindowUncappedUsesTheWholeList is the default shape: no cap, so the
+// only ceiling is one request per course. It has to overlap more than the old
+// fixed cap of three would have allowed.
+func TestFireWindowUncappedUsesTheWholeList(t *testing.T) {
+	p := &portal{delay: 700 * time.Millisecond, registered: map[string]bool{}}
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	defer swap(&regEndpoint, srv.URL)()
+	defer swap(&globalGap, 40*time.Millisecond)()
+	defer swap(&maxInflight, 0)() // no cap
+
+	courses := mkCourses("a", "b", "c", "d", "e", "f")
+	cl := &client{http: &http.Client{Timeout: 5 * time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	fireWindow(ctx, newTestUI(), cl, courses)
+
+	for _, c := range courses {
+		if !c.done {
+			t.Errorf("%s never landed", c.id)
+		}
+	}
+	if p.maxAtOnce <= 3 {
+		t.Errorf("peaked at %d in flight, an uncapped run with 700ms answers should beat the old cap of 3", p.maxAtOnce)
+	}
+	if p.maxAtOnce > len(courses) {
+		t.Errorf("%d in flight for %d courses, a course must never have two requests out at once", p.maxAtOnce, len(courses))
+	}
+	assertSpacing(t, p.arrivals, globalGap)
+}
+
+// TestFireWindowInflightOneIsSerial checks the escape hatch still works, since
+// it is what someone would reach for if TOO_MANY_REQUESTS ever showed up.
+func TestFireWindowInflightOneIsSerial(t *testing.T) {
+	p := &portal{delay: 200 * time.Millisecond, registered: map[string]bool{}}
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	defer swap(&regEndpoint, srv.URL)()
+	defer swap(&globalGap, 20*time.Millisecond)()
+	defer swap(&maxInflight, 1)()
+
+	courses := mkCourses("a", "b", "c")
+	cl := &client{http: &http.Client{Timeout: 5 * time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	fireWindow(ctx, newTestUI(), cl, courses)
+	if p.maxAtOnce != 1 {
+		t.Errorf("peaked at %d in flight, -inflight 1 must stay serial", p.maxAtOnce)
+	}
+}
+
+func TestInflightCapNeverExceedsTheCourseCount(t *testing.T) {
+	defer swap(&maxInflight, 0)()
+	if got := inflightCap(6); got != 6 {
+		t.Errorf("uncapped with 6 courses = %d, want 6", got)
+	}
+	swap(&maxInflight, 99)
+	if got := inflightCap(6); got != 6 {
+		t.Errorf("cap of 99 with 6 courses = %d, want 6", got)
+	}
+	swap(&maxInflight, 2)
+	if got := inflightCap(6); got != 2 {
+		t.Errorf("cap of 2 with 6 courses = %d, want 2", got)
+	}
+}
+
 func TestFireWindowKeepsTheGapWhenAnswersAreInstant(t *testing.T) {
 	p := &portal{delay: 0, registered: map[string]bool{}}
 	srv := httptest.NewServer(p)
