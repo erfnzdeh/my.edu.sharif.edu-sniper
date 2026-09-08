@@ -77,13 +77,21 @@ var (
 	// which is a bad trade now that a rejection is cheap but not free.
 	// See docs/reference/rate-limits.md.
 	globalGap = 1300 * time.Millisecond
-	// maxInflight is how many requests may be waiting for an answer at once.
-	// Inside the window a single answer took two to five seconds, and one
-	// that timed out held the whole queue for ten, so a strictly serial
-	// scheduler spends the contested seconds waiting rather than asking.
-	// The portal has a concurrency guard of its own, TOO_MANY_REQUESTS, so
-	// this stays small.
-	maxInflight = 3
+	// maxInflight caps how many requests may be waiting for an answer at
+	// once. Zero, the default, means no cap, because the scheduler is
+	// already bounded twice over: a course with a request in flight is never
+	// picked again, so there is at most one per course, and no request can
+	// outlive httpTimeout. The real ceiling is the smaller of the list
+	// length and httpTimeout/globalGap, which is about eight at the
+	// defaults.
+	//
+	// A cap below that ceiling throttles sending rather than answering. At
+	// the five second answers measured inside the window, a cap of three
+	// lets a request leave only every 1.7s, which is slower than the gap the
+	// edge actually allows, so the cap and not the limiter sets the pace.
+	// It stays as an escape hatch for TOO_MANY_REQUESTS, the portal's own
+	// concurrency guard, which has never been seen live.
+	maxInflight = 0
 )
 
 // Result codes, taken from the portal frontend bundle.
@@ -231,7 +239,7 @@ func run() int {
 		fCatalogue  = flag.String("catalogue", "", "path or URL of courses.json, overrides the default lookup")
 		fTranscript = flag.String("transcript", "", "transcript file path, defaults to snipe-<timestamp>.log")
 		fGap        = flag.Duration("gap", globalGap, "minimum spacing between two requests, the edge allows one per second")
-		fInflight   = flag.Int("inflight", maxInflight, "how many requests may wait for an answer at once")
+		fInflight   = flag.Int("inflight", maxInflight, "cap on requests waiting for an answer at once, 0 for no cap")
 		fVersion    = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
@@ -241,8 +249,8 @@ func run() int {
 		globalGap = 100 * time.Millisecond
 	}
 	maxInflight = *fInflight
-	if maxInflight < 1 {
-		maxInflight = 1
+	if maxInflight < 0 {
+		maxInflight = 0
 	}
 
 	if *fVersion {
@@ -282,11 +290,20 @@ func run() int {
 	ui.tr = tr
 	ui.info("transcript %s", tr.path)
 	tr.write("BUILD    %s %s/%s %s", buildVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
-	tr.write("PACING   gap=%s cooldown=%s inflight=%d rateLimitBackoff=%s parkedBackoff=%s timeout=%s",
-		globalGap, courseCooldown, maxInflight, rateLimitBackoff, parkedBackoff, httpTimeout)
+	tr.write("PACING   gap=%s cooldown=%s inflight=%s rateLimitBackoff=%s parkedBackoff=%s timeout=%s",
+		globalGap, courseCooldown, inflightNote(len(courses)), rateLimitBackoff, parkedBackoff, httpTimeout)
 
+	// The default transport keeps two idle connections per host, so with
+	// answers overlapping, the third concurrent request onwards would find an
+	// empty pool and pay a fresh TLS handshake, measured at about 650ms, every
+	// time it went out. Keep one warm connection per course instead. If the
+	// portal speaks HTTP/2 this is moot, since one connection carries them
+	// all: the transcript's proto= field says which happened.
+	pool := http.DefaultTransport.(*http.Transport).Clone()
+	pool.MaxIdleConns = 4 * len(courses)
+	pool.MaxIdleConnsPerHost = 2 * len(courses)
 	cl := &client{
-		http:  &http.Client{Timeout: httpTimeout},
+		http:  &http.Client{Timeout: httpTimeout, Transport: pool},
 		token: token,
 		tr:    tr,
 	}
@@ -368,7 +385,7 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 		// the client made rather than from now.
 		nextSend = cl.called().Add(globalGap)
 	)
-	slots := make(chan struct{}, maxInflight)
+	slots := make(chan struct{}, inflightCap(len(courses)))
 	wake := make(chan struct{}, 1)
 	notify := func() {
 		select {
@@ -470,6 +487,23 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 
 	wg.Wait()
 	return authBad
+}
+
+// inflightCap is how many answers may be outstanding. A course with a request
+// in flight is never picked again, so the length of the list is a hard ceiling
+// and an uncapped run simply uses it.
+func inflightCap(courses int) int {
+	if maxInflight <= 0 || maxInflight > courses {
+		return courses
+	}
+	return maxInflight
+}
+
+func inflightNote(courses int) string {
+	if maxInflight <= 0 {
+		return fmt.Sprintf("uncapped, ceiling %d", inflightCap(courses))
+	}
+	return strconv.Itoa(maxInflight)
 }
 
 // choose returns the course that should get the next token, and the soonest
@@ -1237,7 +1271,7 @@ func confirm(ui *ui, courses []*course, s *clockSync, target, fireAt time.Time, 
 	}
 	ui.plain("  window opens  %s", target.Format("2006-01-02 15:04:05.000"))
 	ui.plain("  firing at     %s (in %s)", fireAt.Format("15:04:05.000"), time.Until(fireAt).Truncate(time.Millisecond))
-	ui.plain("  pacing        one request every %s, %s per course, up to %d in flight", globalGap, courseCooldown, maxInflight)
+	ui.plain("  pacing        one request every %s, %s per course, up to %d in flight", globalGap, courseCooldown, inflightCap(len(courses)))
 	if yes {
 		return true
 	}

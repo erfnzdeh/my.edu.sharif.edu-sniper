@@ -158,9 +158,11 @@ expensive. The frontend ships user facing strings for all of it:
 
 `BLOCKED` is keyed on the **student ID**, so unlike the edge limiter it follows
 you across networks and cannot be escaped by reconnecting. `TOO_MANY_REQUESTS`
-is a concurrency guard, which is why the scheduler still sends on a single
-global token and only lets a few answers be outstanding at once. Neither code
-has been seen live. If one shows up, lower `-inflight`.
+is a concurrency guard. The scheduler still sends on a single global token, so
+it never exceeds one request per gap however many answers are outstanding, and
+the number outstanding is capped anyway at one per course. Neither code has been
+seen live. If one shows up, `-inflight` sets a hard cap and `-inflight 1`
+restores serial behaviour.
 
 ---
 

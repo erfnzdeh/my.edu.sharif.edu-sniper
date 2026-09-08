@@ -124,7 +124,7 @@ sequenceDiagram
 
     Note over C: heartbeat, then a per second countdown
     C->>S: GET / at two seconds out, to warm the connection
-    Note over C: the warm up finishes before the window, it spends a token too
+    Note over C: the warm up is sent and not waited for, it spends a token too
 
     Note over C,S: the burst, one request per 1.3s
     loop until every course lands or you stop it
@@ -175,9 +175,29 @@ timeout. A scheduler that waits for each answer before sending the next request
 is paced by the portal's latency rather than by the edge limit, which is the
 one thing it was built to respect.
 
-So the token spacing governs when a request leaves, and up to `-inflight`
-requests may be waiting for an answer at once. The portal has a concurrency
-guard of its own, `TOO_MANY_REQUESTS`, so the default is a modest 3.
+So the token spacing alone governs when a request leaves, and answers land
+whenever they land. There is no cap on outstanding answers by default, because
+the scheduler is already bounded twice over: a course with a request in flight
+is never picked again, so there is at most one per course, and no request
+outlives the 10 second timeout. The ceiling is the smaller of your list length
+and `timeout / gap`, about eight at the defaults.
+
+A cap below that ceiling throttles *sending* rather than answering. With answers
+taking `T` seconds and a cap of `C`, a request can only leave every `T / C`
+seconds, so a cap of 3 against the 5 second answers measured inside the window
+paces you at 1.7s, slower than the edge actually allows. Modelled on the
+2026-09-08 shape, ten courses with three second answers and two requests that
+hang to the timeout, the last course on the list gets its first attempt at:
+
+| | last course's first attempt |
+| --- | --- |
+| `-inflight 3` | 15.2s |
+| uncapped, the default | 11.7s |
+
+11.7s is exactly ten tokens at 1.3s, which is the floor. `-inflight` remains as
+an escape hatch for `TOO_MANY_REQUESTS`, the portal's own concurrency guard,
+which has never been seen live. `-inflight 1` restores the old serial
+behaviour.
 
 ## Decision 3: every course before any second attempt
 
@@ -278,7 +298,7 @@ curl https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/api/courses.json
 | `-catalogue` | Path or URL of `courses.json`. |
 | `-transcript` | Transcript path. Defaults to `snipe-<timestamp>.log`. |
 | `-gap` | Minimum spacing between two requests. Defaults to `1.3s`. |
-| `-inflight` | How many requests may wait for an answer at once. Defaults to `3`. |
+| `-inflight` | Cap on requests waiting for an answer. Defaults to `0`, no cap. |
 | `-version` | Print the version, platform and Go version, then exit. |
 
 Exit codes: `0` when everything landed, `1` when something is still
