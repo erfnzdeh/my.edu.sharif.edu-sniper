@@ -30,8 +30,13 @@ below are the full reference.
 | | `PROJECT_FIRST_REGISTRATION` | |
 
 Every course is retried regardless, because you are watching and can judge
-better than a rule can. Permanent failures are called out in the log with a
-plain explanation so they are obvious at a glance.
+better than a rule can, and because dropping the course a clash is against
+turns a permanent failure into a retryable one. But a permanent failure is
+parked: it waits 45 seconds between tries and sits behind every course that can
+still land, so it cannot take turns from them. On 2026-09-08 a `CLASS_OVERLAP`
+course took nine attempts and roughly twenty eight seconds of scheduler time
+under the old rule. Permanent failures are called out in the log with a plain
+explanation so they are obvious at a glance.
 
 ---
 
@@ -121,9 +126,8 @@ course code cannot be checked against `/api/reg` before the window.
 
 ## Gaps against `permanentFailures`
 
-`permanentFailures` in `cmd/sniper/main.go` currently holds 12 codes. These
-look like they belong there too, and are worth a second opinion before adding,
-since none has been observed live:
+`permanentFailures` in `cmd/sniper/main.go` held 12 codes. These looked like
+they belonged there too:
 
 | Code | Why it looks permanent |
 | --- | --- |
@@ -134,8 +138,19 @@ since none has been observed live:
 | `HAS_INCOMPLETE_PROJECT` | clears only once you register the project course, so not permanent within a session, but retrying this course will not fix it |
 | `PROJECT_FIRST_REGISTRATION` | same |
 
-`COURSE_NOT_IN_CHART`, `VARIABLE_UNITS_EXCEEDED` and `ZERO_UNITS_NOT_POSSIBLE`
-are absent from the README triage table as well.
+All six have since been added to `permanentFailures`, along with
+`REGISTER_IN_EDU`. `PROJECT_FIRST_REGISTRATION` was seen live on 2026-09-08 and
+was retried eight times before the run was stopped by hand.
 
-The distinction matters only for how loudly a failure is reported, since every
-course is retried regardless by design, so this is cosmetic rather than a bug.
+`REPEATED_REQUEST` and `ALREADY_IN_QUEUE` are handled separately again. They
+are not failures: the portal is holding a job with that exact course, unit
+count and action, and will judge it on its own. Both transcripts from that
+window show a course landing from a job that had answered `REPEATED_REQUEST`
+moments earlier. `REPEATED_REQUEST` also arrives as a bare JSON string rather
+than an object, so it carries no `jobs` array to harvest:
+
+```
+"REPEATED_REQUEST 40012345630004-11add"
+```
+
+The key is the student id, the course, the units and the action run together.

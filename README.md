@@ -92,7 +92,7 @@ flowchart LR
     JSON --> SNIPE
     subgraph DAY["Registration day"]
         SNIPE["cmd/sniper<br/>single file, standard library only"]
-        SNIPE -->|"POST /api/reg<br/>one request per 1.1s"| API["my.edu.sharif.edu"]
+        SNIPE -->|"POST /api/reg<br/>one request per 1.3s"| API["my.edu.sharif.edu"]
     end
 ```
 
@@ -124,10 +124,11 @@ sequenceDiagram
 
     Note over C: heartbeat, then a per second countdown
     C->>S: GET / at two seconds out, to warm the connection
+    Note over C: the warm up finishes before the window, it spends a token too
 
-    Note over C,S: the burst, one request per 1.1s
+    Note over C,S: the burst, one request per 1.3s
     loop until every course lands or you stop it
-        C->>S: POST add, highest priority course off cooldown
+        C->>S: POST add, the course with the fewest verdicts so far
         S-->>C: OK, CAPACITY_EXCEEDED, and every other job
     end
 ```
@@ -141,18 +142,19 @@ client, and rejects the excess with a real `429` rather than queueing it. A
 parallel burst therefore throws most of its requests away. Full measurements in
 [docs/reference/rate-limits.md](docs/reference/rate-limits.md).
 
-So the scheduler holds a single global token, released every 1.1 seconds, and
-spends it on the highest priority course that is off its own cooldown:
+So the scheduler holds a single global token, released every 1.3 seconds, and
+spends it on the course that most deserves the next request:
 
 ```mermaid
 flowchart TD
     A["token available"] --> B{"any course off<br/>its 5s cooldown?"}
     B -->|no| C["sleep until the earliest one is ready"] --> A
-    B -->|yes| D["pick the highest priority one"]
-    D --> E["send, then hold the next token for 1.1s"]
+    B -->|yes| D["pick the course with the fewest<br/>verdicts, then by priority"]
+    D --> E["send, then hold the next token for 1.3s"]
     E --> F{"result"}
     F -->|"OK or COURSE_DUPLICATE"| G["done, drop from the list"]
-    F -->|"429"| H["back off 7s for every course"] --> A
+    F -->|"429"| H["hold the shared token 2s,<br/>the course keeps its place"] --> A
+    F -->|"cannot succeed on a retry"| J["park it for 45s,<br/>behind everything else"] --> A
     F -->|"anything else"| I["cooldown 5.2s, retry"] --> A
 ```
 
@@ -161,13 +163,44 @@ between attempts at the same course, and the global rule is one request per
 second overall. With five or more courses the global rule already satisfies
 the per course one, and below that the per course cooldown binds.
 
-## Decision 2: list order is priority order
+The gap is 1.3 seconds rather than 1.1 because round trip jitter regularly
+lands two requests less than a second apart at the edge. At 1.1s about one
+request in seven came back `429`, which buys nothing.
 
-Because requests are paced, the Nth course on your list makes its first
-attempt roughly N seconds after the window opens. With ten courses, the last
-one waits nine seconds. Put the courses that fill in seconds at the top.
+## Decision 2: sending does not wait for the answer
 
-## Decision 3: sleep precisely, and land slightly late on purpose
+Inside the window the portal is slow. Answers measured between 2 and 5 seconds
+on 2026-09-08, and one that never came held the queue for the full 10 second
+timeout. A scheduler that waits for each answer before sending the next request
+is paced by the portal's latency rather than by the edge limit, which is the
+one thing it was built to respect.
+
+So the token spacing governs when a request leaves, and up to `-inflight`
+requests may be waiting for an answer at once. The portal has a concurrency
+guard of its own, `TOO_MANY_REQUESTS`, so the default is a modest 3.
+
+## Decision 3: every course before any second attempt
+
+List order is priority order, but a course the backend has already judged
+yields to one it has never seen. The first pass therefore covers the whole
+list, and only then does anything get a second try.
+
+This matters more than it sounds. Under strict priority order, on 2026-09-08,
+one run spent four attempts and thirty seconds on its first course while the
+last two courses on the list never received a single request. A verdict on a
+course you have not asked about is worth more than a repeat verdict on one you
+have.
+
+Because requests are paced, the Nth course on your list makes its first attempt
+roughly 1.3N seconds after the window opens. With ten courses, the last one
+waits about twelve seconds. Put the courses that fill in seconds at the top.
+
+A result that cannot change on a retry, a class clash or a wrong unit count,
+parks the course for 45 seconds and puts it behind everything else. It is still
+retried, because you may drop whatever it clashes with, but it no longer takes
+turns from a course that can still land.
+
+## Decision 4: sleep precisely, and land slightly late on purpose
 
 The client computes one sleep from the server's own clock rather than polling
 toward the window. Given a probe sent at `t0`, answered at `t1`, with the
@@ -182,7 +215,7 @@ burns that course's five second cooldown, so a request 100ms early costs about
 five seconds. A request 100ms late costs 100ms. The client prints this
 derivation with your actual numbers before it commits to a fire time.
 
-## Decision 4: units come from the catalogue
+## Decision 5: units come from the catalogue
 
 The portal range checks units between `0` and the course's own value, and
 courses flagged `isVariable` accept anything in that range. A mismatch fails
@@ -244,6 +277,8 @@ curl https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/api/courses.json
 | `-y` | Skip the confirmation prompt. Needs `-token` and `-courses`. |
 | `-catalogue` | Path or URL of `courses.json`. |
 | `-transcript` | Transcript path. Defaults to `snipe-<timestamp>.log`. |
+| `-gap` | Minimum spacing between two requests. Defaults to `1.3s`. |
+| `-inflight` | How many requests may wait for an answer at once. Defaults to `3`. |
 | `-version` | Print the version, platform and Go version, then exit. |
 
 Exit codes: `0` when everything landed, `1` when something is still
