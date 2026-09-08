@@ -3,8 +3,43 @@
 Three independent mechanisms sit between you and a successful `add`. Only the
 first one is usually visible.
 
-Measurements below were taken on 2026-09-07 from a single residential IP,
-outside a registration window. Each row is a real run, not an estimate.
+Measurements in the numbered sections were taken on 2026-09-07 from a single
+residential IP, outside a registration window. Each row is a real run, not an
+estimate. The section that follows is from a live window, where the numbers are
+very different.
+
+---
+
+## What the 2026-09-08 window actually showed
+
+Two transcripts from the same 08:00 window, two different machines and links.
+Both lost their opening shot the same way, and neither loss was the portal's
+doing.
+
+| | run A | run B |
+| --- | --- | --- |
+| warm up `GET` finished | 08:00:00.538 | 07:59:57.804 |
+| first `POST` sent | 08:00:00.538 | 07:59:57.804 |
+| result | `429` in 40ms | `429` in 7ms |
+
+The warm up was called after the wait for the window rather than inside its own
+lead, so it ran at the fire time and the first `POST` followed it in the same
+millisecond. Since every request to the host increments the counter, the
+opening request was guaranteed to be rejected. Both runs then froze for 7
+seconds, and run A repeated the whole sequence at 08:00:08, so 16 of the first
+17 seconds of the window produced nothing.
+
+Round trip time inside the window is nothing like the quiet-hour measurements
+above:
+
+| | outside the window | inside it |
+| --- | --- | --- |
+| typical | 46ms to 2037ms | 2.1s to 5.1s |
+| worst seen | 2037ms | timed out at 10s, twice in a row |
+
+Both of run B's timeouts had in fact registered the course. A request that
+gives up client side may still have been carried out, so the answer to a
+timeout is to let the next response tell you, not to resend.
 
 ---
 
@@ -42,20 +77,19 @@ second apart at the edge.
 
 ### Consequence for `globalGap`
 
-`globalGap` is 1100ms today, which loses roughly one request in seven. That
-would be a fair trade if a rejection were cheap, but in the current scheduler a
-`429` backs off **every** course by 7 seconds. Paying an extra 200ms per
-request to avoid a 1-in-7 chance of a 7 second stall is a large win:
+`globalGap` was 1100ms, which loses roughly one request in seven. That would be
+a fair trade if a rejection were cheap, but the scheduler then backed off
+**every** course by 7 seconds. Paying an extra 200ms per request to avoid a
+1-in-7 chance of a 7 second stall is a large win:
 
 - at 1.10s, an expected ~14% of requests cost 7s each
 - at 1.30s, every request costs 200ms more and nothing stalls
 
 With ten courses the last one's first attempt moves from 9.9s to 11.7s after
-the window opens, against removing the risk of a 7 second global freeze in the
-first few seconds. Raising `globalGap` to about 1300ms looks strictly better.
-Worth re-measuring from the campus network before changing it, since the jitter
-is what drives the result and it will differ from the link these numbers came
-from.
+the window opens, against removing the risk of a global freeze in the first few
+seconds. `globalGap` is now 1300ms and `rateLimitBackoff` is 2s, and the gap is
+exposed as `-gap` because the jitter that drives it differs by link. Still
+worth re-measuring from the campus network.
 
 ---
 
@@ -84,8 +118,8 @@ Every pair rejected the registration call. So:
 
 This confirms the README's warning that the warm up spends a token, and that it
 must not run inside the last second. `warmupLead` of 2s against a `globalGap`
-of 1.1s leaves 2.1s between the warm up `GET` and the first `POST`, which is
-comfortable.
+of 1.3s leaves 2s between the warm up `GET` and the first `POST`, which is
+enough. It is also exactly what the 2026-09-08 runs failed to do: see above.
 
 It also means the limiter is keyed on **IP, not on token**. Alternating
 authenticated and unauthenticated requests shared a single budget (11/12 at
@@ -124,8 +158,9 @@ expensive. The frontend ships user facing strings for all of it:
 
 `BLOCKED` is keyed on the **student ID**, so unlike the edge limiter it follows
 you across networks and cannot be escaped by reconnecting. `TOO_MANY_REQUESTS`
-is a concurrency guard, which is the reason the scheduler holds a single global
-token rather than running requests in parallel.
+is a concurrency guard, which is why the scheduler still sends on a single
+global token and only lets a few answers be outstanding at once. Neither code
+has been seen live. If one shows up, lower `-inflight`.
 
 ---
 
