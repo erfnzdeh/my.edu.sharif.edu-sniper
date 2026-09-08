@@ -377,6 +377,37 @@ func TestApplyCodeTimingRejectionKeepsThePlace(t *testing.T) {
 	}
 }
 
+// TestTimingRejectionIsOnlyFreeOnce: a partial window, where the portal keeps
+// refusing one course on timing grounds while the others get real verdicts.
+// After its free first rejection the refused course has to count like any
+// other, or it sits at judged 0 and takes the token ahead of every course that
+// can still land, every time it comes off cooldown, for the rest of the run.
+func TestTimingRejectionIsOnlyFreeOnce(t *testing.T) {
+	courses := mkCourses("40760-1", "40634-1")
+	refused, judged := courses[0], courses[1]
+	now := time.Now()
+
+	applyCode(newTestUI(), refused, 1, "REGISTRATION_TIME_LIMIT", 0)
+	applyCode(newTestUI(), judged, 1, "CAPACITY_EXCEEDED", 0)
+	if pick, _ := choose(courses, now); pick != refused {
+		t.Fatalf("after one timing rejection pick = %s, want the refused course to keep its place", pick.id)
+	}
+
+	applyCode(newTestUI(), refused, 2, "REGISTRATION_TIME_LIMIT", 0)
+	if refused.judged != 1 {
+		t.Fatalf("judged = %d after a second timing rejection, want 1", refused.judged)
+	}
+	if refused.parked || refused.done {
+		t.Fatalf("parked=%t done=%t, a timing code is neither permanent nor a success", refused.parked, refused.done)
+	}
+	// Both are now judged once, so list order decides again, and a third
+	// rejection puts the refused course behind the one with a real verdict.
+	applyCode(newTestUI(), refused, 3, "REGISTRATION_TIME_LIMIT", 0)
+	if pick, _ := choose(courses, now); pick != judged {
+		t.Fatalf("after three timing rejections pick = %s, want the course with a real verdict", pick.id)
+	}
+}
+
 func TestPostTurnsAnErrorFieldIntoAResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"error":"TOO_MANY_REQUESTS"}`)

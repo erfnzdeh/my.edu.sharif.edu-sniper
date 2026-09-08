@@ -140,11 +140,15 @@ sequenceDiagram
 
 ---
 
-## Decision 1: pace at one request per second
+## Decision 1: pace at about one request per second
 
-This is the whole game. The edge allows one request per second, applied per
-client, and rejects the excess with a real `429` rather than queueing it. A
-parallel burst therefore throws most of its requests away. Full measurements in
+This is the whole game. The edge rejects requests that follow too closely on
+the previous one from the same IP with a real `429` rather than queueing them,
+so a parallel burst throws most of its requests away. How close is too close
+is not known exactly. Every measurement so far fits a limit of about one
+request per second counted when the request arrives, but none of them proves
+it, and one rejection on 2026-09-08 came five seconds after anything the
+sniper had sent. Full measurements, and what they do not settle, are in
 [docs/reference/rate-limits.md](docs/reference/rate-limits.md).
 
 So the scheduler holds a single global token, released every 1.3 seconds, and
@@ -168,9 +172,13 @@ between attempts at the same course, and the global rule is one request per
 second overall. With five or more courses the global rule already satisfies
 the per course one, and below that the per course cooldown binds.
 
-The gap is 1.3 seconds rather than 1.1 because round trip jitter regularly
-lands two requests less than a second apart at the edge. At 1.1s about one
-request in seven came back `429`, which buys nothing.
+The gap is 1.3 seconds rather than 1.1 because at 1.1s about one request in
+seven came back `429` on 2026-09-07, and at 1.3s none did. That is a small
+sample and a working default rather than a measured threshold, which is why
+`-gap` exists. The token is counted from the moment a request is written to
+the connection, not from when the scheduler decided to send it, because a
+request that has to open a connection first reaches the edge several hundred
+milliseconds later than one on a warm connection.
 
 ## Decision 2: sending does not wait for the answer
 

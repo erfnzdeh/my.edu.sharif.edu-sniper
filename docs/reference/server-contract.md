@@ -11,7 +11,7 @@ This is the summary. The rest of this directory is the detail behind it:
 
 | Measured behaviour | Consequence for the client |
 | --- | --- |
-| The edge allows **exactly one request per second, with no burst**, and rejects the rest with a real HTTP `429` and an HTML body. | A parallel burst throws most of its requests away. Pacing is the single most important thing the client does. |
+| The edge rejects a request that follows the previous one too closely with a real HTTP `429` and an HTML body. Every measurement fits **about one request per second, no burst**, but none proves it. | A parallel burst throws most of its requests away. Pacing is the single most important thing the client does, and the gap is a working default, not a measured threshold. |
 | **Every** request to the host counts, including a plain `GET /`. | Connection warm up must happen well before the window, never immediately before it. |
 | Application errors arrive as **HTTP 200** with an `error` field in the JSON body. | Status codes cannot be used to detect failure, apart from `429`. |
 | Auth failure is `{"error":"AUTHORIZATION"}`, never a `401`. | The token check has to read the body. |
@@ -38,7 +38,7 @@ time and server time agree.
 
 | Row | Detail |
 | --- | --- |
-| one request per second, `429` on the rest | [rate-limits.md](rate-limits.md), including a re-measurement on a warm pooled connection |
+| about one request per second, `429` on the rest | [rate-limits.md](rate-limits.md), including a re-measurement on a warm pooled connection and what the live window did not settle |
 | every request counts, including `GET /` | [rate-limits.md](rate-limits.md#2-which-requests-count-and-which-get-rejected), where counting and rejection turn out to be different sets |
 | errors arrive as HTTP 200 | [http-api.md](http-api.md#conventions) |
 | auth failure is a body, not a `401` | [auth.md](auth.md) |
