@@ -53,6 +53,14 @@ const (
 	// freeze costs far more than the rejection did: on 2026-09-08 two 429s
 	// cost fourteen seconds of the most contested part of the window.
 	rateLimitBackoff = 2 * time.Second
+	// rejectRetry is how soon to try again after the edge rejects a request.
+	// A rejection is cheap, a median of 43ms against 60ms for one that is
+	// accepted, and it does not reset the limiter's clock, so the boundary
+	// is worth polling rather than waiting politely behind. It doubles after
+	// each consecutive rejection, up to rejectRunCap, as a guard for a
+	// situation this model does not cover.
+	rejectRetry  = 200 * time.Millisecond
+	rejectRunCap = 3
 	// How long to hold every request after the portal reports BLOCKED. Its
 	// own text says minutes, and the block follows the student id rather than
 	// the connection, so there is nothing to gain by probing sooner.
@@ -76,12 +84,20 @@ const (
 // Pacing, overridable from the command line because the right values depend
 // on the link and both cost something when they are wrong.
 var (
-	// globalGap is the minimum spacing between two requests. The edge looks
-	// like about one per second, and counts every request to the host,
-	// including the warm up. A 1.1s gap lost about one request in seven to
-	// round trip jitter, which is a bad trade now that a rejection is cheap
-	// but not free. A working default from small samples, hence the flag.
-	// See docs/reference/rate-limits.md.
+	// globalGap is the minimum time between the last request the edge
+	// ACCEPTED and the next one sent. That clock is the one the limiter
+	// runs on, which is not the same as spacing your own sends: a request
+	// the edge rejects is never counted and does not reset it.
+	//
+	// Measured on 2026-09-08 over 280 requests at a quiet hour. Below one
+	// second since the last accepted request, 98 of 98 were rejected. Above
+	// 1.05s, 3 of 171. The threshold is 1.000s and the bucket holds exactly
+	// one, so there is no burst to exploit. The 300ms on top is margin for
+	// round trip jitter, which is what the residual few percent is.
+	//
+	// The limiter counts every request to the host from your IP, whatever
+	// the path and whatever the token, so a browser sitting on the portal
+	// spends these tokens too. See docs/reference/rate-limits.md.
 	globalGap = 1300 * time.Millisecond
 	// maxInflight caps how many requests may be waiting for an answer at
 	// once. Zero, the default, means no cap, because the scheduler is
@@ -321,8 +337,8 @@ func run() int {
 	ui.tr = tr
 	ui.info("transcript %s", tr.path)
 	tr.write("BUILD    %s %s/%s %s", buildVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
-	tr.write("PACING   gap=%s cooldown=%s inflight=%s rateLimitBackoff=%s parkedBackoff=%s timeout=%s",
-		globalGap, courseCooldown, inflightNote(len(courses)), rateLimitBackoff, parkedBackoff, httpTimeout)
+	tr.write("PACING   gap=%s from the last ACCEPTED request, cooldown=%s inflight=%s rejectRetry=%s hold=%s parkedBackoff=%s timeout=%s",
+		globalGap, courseCooldown, inflightNote(len(courses)), rejectRetry, rateLimitBackoff, parkedBackoff, httpTimeout)
 
 	// The default transport keeps two idle connections per host, so with
 	// answers overlapping, the third concurrent request onwards would find an
@@ -412,10 +428,16 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 		wg       sync.WaitGroup
 		authBad  bool
 		inflight int
-		// nextSend is the earliest the next request may leave. The warm up
-		// spends a token like any other request, so start from the last call
-		// the client made rather than from now.
-		nextSend = cl.called().Add(globalGap)
+		// nextSend is the earliest the next request may leave, and it is
+		// optimistic: sending advances it as though the edge will accept,
+		// because the edge decides on arrival even though the answer takes
+		// seconds. A rejection rolls it back. The warm up spends a token
+		// like any other request, so start from whatever the edge last
+		// accepted rather than from now.
+		nextSend = cl.accepted().Add(globalGap)
+		// rejectRun counts rejections since the last acceptance, so that a
+		// situation this model does not cover cannot become a hot loop.
+		rejectRun int
 	)
 	slots := make(chan struct{}, inflightCap(len(courses)))
 	wake := make(chan struct{}, 1)
@@ -431,7 +453,8 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 		// The client records when each request was actually written, which
 		// is later than the scheduler's send time on a cold connection, and
 		// the warm up writes a request the scheduler never sent at all.
-		if ns := cl.called().Add(globalGap); ns.After(nextSend) {
+		// Only requests the edge accepted move this clock.
+		if ns := cl.accepted().Add(globalGap); ns.After(nextSend) {
 			nextSend = ns
 		}
 		finished, wait := allDone(courses), time.Until(nextSend)
@@ -492,12 +515,20 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 				// request, so this is not a judgement on the course and it
 				// keeps its place in the queue. Only the shared token moves,
 				// because the limiter is keyed on the IP, not on the course.
+				//
+				// The rejected request was never counted, so the wait is
+				// until a token past whatever the edge last accepted, which
+				// is at most one gap away and usually less. Backing off a
+				// fixed two seconds from the rejection, as this used to,
+				// overshot by seconds at the one moment that matters.
 				c.last = "429"
 				c.next = sent
-				if back := time.Now().Add(rateLimitBackoff); back.After(nextSend) {
-					nextSend = back
-				}
-				ui.attempt(c, attempt, "429 RATE LIMITED", fmt.Sprintf("edge rejected it, next token in %s", rateLimitBackoff), rtt, kindWarn)
+				rejectRun++
+				poll := rejectRetry * time.Duration(1<<min(rejectRun-1, rejectRunCap))
+				nextSend = later(cl.accepted().Add(globalGap), time.Now().Add(poll))
+				ui.attempt(c, attempt, "429 RATE LIMITED",
+					fmt.Sprintf("edge rejected it, it was never counted, retrying at %s",
+						nextSend.Format("15:04:05.000")), rtt, kindWarn)
 			case errors.Is(err, errAuth):
 				authBad = true
 				ui.fatal("token rejected or expired, log in again and rerun")
@@ -514,6 +545,7 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 				}
 				ui.attempt(c, attempt, str.code, fmt.Sprintf("%s, next token in %s", h.why, h.hold), rtt, kindWarn)
 			case errors.As(err, &str):
+				rejectRun = 0
 				applyCode(ui, c, attempt, str.code, rtt)
 			case err != nil:
 				// A request that gave up client side may still have been
@@ -524,6 +556,7 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 				c.last = "error"
 				ui.attempt(c, attempt, "REQUEST FAILED", err.Error()+" (it may still have been carried out)", rtt, kindWarn)
 			default:
+				rejectRun = 0
 				applyJobs(ui, courses, c, attempt, resp, rtt)
 				ui.setRemaining(resp.RemainingActions)
 			}
@@ -606,6 +639,14 @@ func waitForWake(ctx context.Context, wake <-chan struct{}, earliest time.Time) 
 	case <-wake:
 	case <-ctx.Done():
 	}
+}
+
+// later is the more distant of two instants.
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func freeNote(earliest time.Time) string {
@@ -806,6 +847,7 @@ type client struct {
 	mu       sync.Mutex
 	seq      int
 	lastCall time.Time
+	lastOK   time.Time
 }
 
 // stringResult is a result code that arrived without a jobs array: either a
@@ -839,6 +881,18 @@ func (c *client) called() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lastCall
+}
+
+// accepted is when the edge last let a request through, taken at the moment
+// the request was written rather than when the answer came back. The limiter
+// runs on this clock: a request it rejected was never counted and left it
+// untouched, so pacing from the last send overstates how long you have to
+// wait after a rejection and understates it after an acceptance you have not
+// heard about yet.
+func (c *client) accepted() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastOK
 }
 
 func (c *client) add(co *course) (*regResponse, time.Duration, error) {
@@ -919,6 +973,7 @@ func (c *client) do(req *http.Request, seq int) (*http.Response, []byte, time.Du
 	var (
 		reused, dialed          bool
 		writes                  int
+		wroteAt                 time.Time
 		start                   time.Time
 		dnsAt, connAt, tlsAt    time.Time
 		dns, connect, handshake time.Duration
@@ -940,6 +995,7 @@ func (c *client) do(req *http.Request, seq int) (*http.Response, []byte, time.Du
 			writes++
 			c.mu.Lock()
 			c.lastCall = time.Now()
+			wroteAt = c.lastCall
 			c.mu.Unlock()
 		},
 		GotFirstResponseByte: func() { ttfb = time.Since(start) },
@@ -958,6 +1014,17 @@ func (c *client) do(req *http.Request, seq int) (*http.Response, []byte, time.Du
 	}
 	defer res.Body.Close()
 	raw, readErr := io.ReadAll(res.Body)
+
+	// Anything the edge did not reject was counted against the limiter, at
+	// the moment it was written. Answers can come back out of order, so keep
+	// the latest.
+	if res.StatusCode != http.StatusTooManyRequests && !wroteAt.IsZero() {
+		c.mu.Lock()
+		if wroteAt.After(c.lastOK) {
+			c.lastOK = wroteAt
+		}
+		c.mu.Unlock()
+	}
 
 	c.tr.write("RESPONSE #%d status=%d rtt=%s proto=%s bytes=%d", seq, res.StatusCode, rtt, res.Proto, len(raw))
 	c.tr.write("TIMING   #%d reused=%t dialed=%t dns=%s connect=%s tls=%s ttfb=%s writes=%d",

@@ -458,3 +458,104 @@ func swap[T any](p *T, v T) func() {
 	*p = v
 	return func() { *p = old }
 }
+
+// TestRejectionDoesNotAdvanceTheAcceptedClock pins the finding the pacing now
+// rests on: the edge counts what it accepts, so a 429 must leave that clock
+// alone. Measured 2026-09-08, 98 of 98 requests sent under a second after the
+// last accepted one were rejected, while a rejected request never reset it.
+func TestRejectionDoesNotAdvanceTheAcceptedClock(t *testing.T) {
+	var reject bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reject {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, "<html>429</html>")
+			return
+		}
+		json.NewEncoder(w).Encode(regResponse{Time: time.Now().UnixMilli()})
+	}))
+	defer srv.Close()
+	defer swap(&regEndpoint, srv.URL)()
+
+	cl := &client{http: &http.Client{Timeout: 2 * time.Second}}
+
+	reject = true
+	if _, _, err := cl.add(&course{id: "a", units: 1}); !errors.Is(err, errRateLimited) {
+		t.Fatalf("err = %v, want errRateLimited", err)
+	}
+	if !cl.accepted().IsZero() {
+		t.Error("a rejected request advanced the accepted clock, so pacing would wait for a token that was never spent")
+	}
+	if cl.called().IsZero() {
+		t.Error("a rejected request should still count as a call, it did leave the machine")
+	}
+
+	reject = false
+	if _, _, err := cl.add(&course{id: "a", units: 1}); err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	if cl.accepted().IsZero() {
+		t.Error("an accepted request did not advance the accepted clock")
+	}
+}
+
+// TestFireWindowRetriesSoonAfterARejection is the change that matters at a
+// window. A rejection was never counted, so the next attempt is due a token
+// after the last ACCEPTED request, not a fixed backoff after the rejection.
+// The old code waited rateLimitBackoff, two seconds, from the rejection.
+func TestFireWindowRetriesSoonAfterARejection(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		arrivals []time.Time
+		rejected []bool
+		first    = true
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body regRequest
+		json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		rej := first
+		first = false
+		rejected = append(rejected, rej)
+		mu.Unlock()
+
+		if rej {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, "<html>429</html>")
+			return
+		}
+		json.NewEncoder(w).Encode(regResponse{
+			Jobs: []job{{CourseID: body.Course, Result: resultOK}}, Time: time.Now().UnixMilli(),
+		})
+	}))
+	defer srv.Close()
+
+	defer swap(&regEndpoint, srv.URL)()
+	defer swap(&globalGap, 300*time.Millisecond)()
+	defer swap(&maxInflight, 0)()
+
+	courses := mkCourses("a", "b")
+	cl := &client{http: &http.Client{Timeout: 3 * time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fireWindow(ctx, newTestUI(), cl, courses)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(arrivals) < 2 || !rejected[0] {
+		t.Fatalf("expected a rejection followed by a retry, got %d requests", len(arrivals))
+	}
+	recovery := arrivals[1].Sub(arrivals[0])
+	// Nothing had been accepted yet, so the retry is due one gap after the
+	// zero clock, which is immediately, plus the poll delay. Either way it
+	// must be nowhere near the two second backoff this replaced.
+	if recovery > time.Second {
+		t.Errorf("waited %s after a rejection before retrying, want well under the 2s the old fixed backoff cost", recovery)
+	}
+	for _, c := range courses {
+		if !c.done {
+			t.Errorf("%s never landed", c.id)
+		}
+	}
+}
