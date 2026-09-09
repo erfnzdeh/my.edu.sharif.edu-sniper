@@ -10,24 +10,31 @@ very different.
 
 ---
 
-## What the 2026-09-08 window actually showed
+## What the live windows actually showed
 
-Two transcripts from the same 08:00 window, two different machines and links.
-Both lost their opening shot the same way, and neither loss was the portal's
-doing.
+Three transcripts, from three machines and links: runs A and B share the
+2026-09-08 08:00 window, run C is 2026-09-09. All three were the v1.0.x
+scheduler, and all three lost their opening shot the same way. None of those
+losses was the portal's doing.
 
-| | run A | run B |
-| --- | --- | --- |
-| warm up `GET` finished | 08:00:00.538 | 07:59:57.804 |
-| first `POST` sent | 08:00:00.538 | 07:59:57.804 |
-| result | `429` in 40ms | `429` in 7ms |
+| | run A | run B | run C |
+| --- | --- | --- | --- |
+| warm up `GET` written | 08:00:00.538 | 07:59:57.804 | 08:00:00.774 |
+| first `POST` written | 08:00:00.538 | 07:59:57.804 | 08:00:01.092 |
+| gap between them | same millisecond | same millisecond | 318ms |
+| result | `429` in 40ms | `429` in 7ms | `429` in 44ms |
 
 The warm up was called after the wait for the window rather than inside its own
-lead, so it ran at the fire time and the first `POST` followed it in the same
-millisecond. Since every request to the host increments the counter, the
-opening request was guaranteed to be rejected. Both runs then froze for 7
-seconds, and run A repeated the whole sequence at 08:00:08, so 16 of the first
-17 seconds of the window produced nothing.
+lead, so it ran at the fire time and the first `POST` followed it immediately.
+Since every request to the host increments the counter, the opening request was
+guaranteed to be rejected. Runs A and B then froze for 7 seconds, and run A
+repeated the whole sequence at 08:00:08, so 16 of the first 17 seconds of the
+window produced nothing.
+
+Run C is the only one of the three that puts a number on the gap rather than
+firing both requests in the same millisecond. 318ms since the previous request
+was not enough, which is the closest thing here to a lower bound measured
+inside a window rather than at a quiet hour.
 
 Round trip time inside the window is nothing like the quiet-hour measurements
 above:
@@ -35,11 +42,22 @@ above:
 | | outside the window | inside it |
 | --- | --- | --- |
 | typical | 46ms to 2037ms | 2.1s to 5.1s |
-| worst seen | 2037ms | timed out at 10s, twice in a row |
+| worst seen, runs A and B | 2037ms | timed out at 10s, twice in a row |
+| worst seen, run C | not measured | nothing answered for 84 seconds |
 
 Both of run B's timeouts had in fact registered the course. A request that
 gives up client side may still have been carried out, so the answer to a
 timeout is to let the next response tell you, not to resend.
+
+Run C is the worst case on record and the reason `httpTimeout` matters. Seven
+consecutive requests timed out at 10s and not one answer came back, so the run
+ended with nothing registered. Under the v1.0.x scheduler, which sent inline
+and picked under strict priority, each timeout froze the whole run for the full
+10s and a 10s attempt outlasts the 5.2s course cooldown, so the top of the list
+was eligible again every time round: nine attempts on one course and no request
+at all for the other five. That is what the scheduler rewrite is for. It does
+not make the portal answer, but it spends the same 84 seconds on six courses
+instead of one.
 
 Run A's rejections look inconsistent at first: a request sent 1.101s after the
 previous one was rejected and one sent 1.102s after was accepted. The
@@ -51,9 +69,14 @@ pair were both on a warm connection. Spacing has to be measured from when the
 request is written, which is what the client now does.
 
 Run B also took a second `429` at 08:00:35, a full 5 seconds after its previous
-request and in the same millisecond as the answer to it. Nothing the sniper
-sent explains that, and it is the one observation no per client model covers. The limiter is keyed on the IP, so the traffic came from
-alongside it: a click in the browser, or another student behind the same NAT.
+request and in the same millisecond as the answer to it. Run C took one at
+08:00:58.193, 10.0 seconds after its previous request was written and with
+nothing of its own accepted in between, since every request in that stretch had
+timed out. Nothing either sniper sent explains those, and they are the
+observations no per client model covers. Two of them, on different machines and
+different days, is what makes the alternative concrete: the limiter is keyed on
+the IP, so the traffic came from alongside it, a click in the browser or
+another student behind the same NAT.
 The scheduler now treats a `429` as evidence that the rejected request was
 never counted: the course keeps its place, and the next request is due a token
 after whatever the edge last accepted rather than a fixed wait after the
