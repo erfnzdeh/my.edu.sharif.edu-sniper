@@ -435,6 +435,12 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 		// like any other request, so start from whatever the edge last
 		// accepted rather than from now.
 		nextSend = cl.accepted().Add(globalGap)
+		// presumed is the send time of the newest request the edge has not
+		// rejected, and it is what nextSend is measured from. A 429 gives up
+		// that request's own claim on the clock and nobody else's: when the
+		// edge is slow to reject, which is what a contested window does, a
+		// later request has already left and is still presumed counted.
+		presumed = cl.accepted()
 		// rejectRun counts rejections since the last acceptance, so that a
 		// situation this model does not cover cannot become a hot loop.
 		rejectRun int
@@ -452,9 +458,12 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 		mu.Lock()
 		// The client records when each request was actually written, which
 		// is later than the scheduler's send time on a cold connection, and
-		// the warm up writes a request the scheduler never sent at all.
-		// Only requests the edge accepted move this clock.
-		if ns := cl.accepted().Add(globalGap); ns.After(nextSend) {
+		// the warm up writes a request the scheduler never sent at all, so
+		// a confirmed acceptance can sit ahead of anything sent from here.
+		if a := cl.accepted(); a.After(presumed) {
+			presumed = a
+		}
+		if ns := presumed.Add(globalGap); ns.After(nextSend) {
 			nextSend = ns
 		}
 		finished, wait := allDone(courses), time.Until(nextSend)
@@ -463,9 +472,13 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 			break
 		}
 		// Loop rather than fall through after sleeping: an answer arriving
-		// meanwhile can land the last course or push the token further out.
+		// meanwhile can land the last course, push the token further out, or
+		// bring it forward, which is why the sleep ends on one. A rejected
+		// request was never counted, so its retry falls due a poll later
+		// rather than a whole gap, and sleeping blind through the rejection
+		// gave that back as the fixed backoff it was meant to replace.
 		if wait > 0 {
-			if !sleepCtx(ctx, wait) {
+			if !sleepOrWake(ctx, wake, wait) {
 				break
 			}
 			continue
@@ -492,6 +505,7 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 		pick.next = sent.Add(courseCooldown)
 		attempt := pick.attempts
 		nextSend = sent.Add(globalGap)
+		presumed = sent
 		inflight++
 		ui.tr.write("SCHED    send %s attempt %d, %d in flight, next token at %s",
 			pick.id, attempt, inflight, nextSend.Format("15:04:05.000"))
@@ -525,7 +539,12 @@ func fireWindow(parent context.Context, ui *ui, cl *client, courses []*course) b
 				c.next = sent
 				rejectRun++
 				poll := rejectRetry * time.Duration(1<<min(rejectRun-1, rejectRunCap))
-				nextSend = later(cl.accepted().Add(globalGap), time.Now().Add(poll))
+				if presumed.Equal(sent) {
+					// Nothing has left since the request the edge threw
+					// away, so its claim is the only one to give up.
+					presumed = cl.accepted()
+				}
+				nextSend = later(presumed.Add(globalGap), time.Now().Add(poll))
 				ui.attempt(c, attempt, "429 RATE LIMITED",
 					fmt.Sprintf("edge rejected it, it was never counted, retrying at %s",
 						nextSend.Format("15:04:05.000")), rtt, kindWarn)
@@ -632,13 +651,21 @@ func waitForWake(ctx context.Context, wake <-chan struct{}, earliest time.Time) 
 		}
 		return
 	}
-	t := time.NewTimer(time.Until(earliest))
+	sleepOrWake(ctx, wake, time.Until(earliest))
+}
+
+// sleepOrWake waits out d, or until an answer lands, whichever comes first,
+// and reports whether the run is still going.
+func sleepOrWake(ctx context.Context, wake <-chan struct{}, d time.Duration) bool {
+	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-t.C:
 	case <-wake:
 	case <-ctx.Done():
+		return false
 	}
+	return true
 }
 
 // later is the more distant of two instants.

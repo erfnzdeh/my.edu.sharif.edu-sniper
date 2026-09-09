@@ -162,7 +162,7 @@ flowchart TD
     D --> E["send, then hold the next token for 1.3s"]
     E --> F{"result"}
     F -->|"OK or COURSE_DUPLICATE"| G["done, drop from the list"]
-    F -->|"429"| H["hold the shared token 2s,<br/>the course keeps its place"] --> A
+    F -->|"429"| H["never counted: retry at the<br/>boundary, the course keeps its place"] --> A
     F -->|"cannot succeed on a retry"| J["park it for 45s,<br/>behind everything else"] --> A
     F -->|"anything else"| I["cooldown 5.2s, retry"] --> A
 ```
@@ -175,7 +175,11 @@ the per course one, and below that the per course cooldown binds.
 The gap is 1.3 seconds rather than 1.1 because at 1.1s about one request in
 seven came back `429` on 2026-09-07, and at 1.3s none did. That is a small
 sample and a working default rather than a measured threshold, which is why
-`-gap` exists. The token is counted from the moment a request is written to
+`-gap` exists. The gap runs from the last request the edge **accepted**, not
+from the last one sent. A request it rejects is never counted and leaves that
+clock untouched, so a `429` costs a poll at the boundary rather than a fixed
+backoff, and the rejected request gives up its own claim on the clock and
+nobody else's. Acceptance is timed from the moment the request is written to
 the connection, not from when the scheduler decided to send it, because a
 request that has to open a connection first reaches the edge several hundred
 milliseconds later than one on a warm connection.

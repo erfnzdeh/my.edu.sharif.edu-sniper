@@ -559,3 +559,177 @@ func TestFireWindowRetriesSoonAfterARejection(t *testing.T) {
 		}
 	}
 }
+
+// TestFireWindowKeepsFiringWhileAnswersTimeOut reproduces the window a friend
+// caught on camera: the portal answered nothing inside the client timeout, so
+// almost every request died at 10s. The released v1.0.x scheduler sent inline
+// and picked under strict priority, so each timeout froze the whole run for
+// the full timeout and the first course on the list was eligible again the
+// moment it unfroze. One course absorbed nine attempts across eighty seconds
+// while five courses never got a single request. Sending has to carry on
+// while answers are outstanding.
+func TestFireWindowKeepsFiringWhileAnswersTimeOut(t *testing.T) {
+	const (
+		gap     = 60 * time.Millisecond
+		timeout = 400 * time.Millisecond
+	)
+	var (
+		mu      sync.Mutex
+		arrived []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body regRequest
+		json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		arrived = append(arrived, body.Course)
+		mu.Unlock()
+		<-r.Context().Done() // never answer, exactly as the live window did
+	}))
+	defer srv.Close()
+
+	defer swap(&regEndpoint, srv.URL)()
+	defer swap(&globalGap, gap)()
+	defer swap(&maxInflight, 0)()
+
+	courses := mkCourses("a", "b", "c", "d", "e", "f")
+	cl := &client{http: &http.Client{Timeout: timeout}}
+	// One timeout's worth of window. Under the old scheduler that bought one
+	// request; six courses one gap apart all fit inside it.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	fireWindow(ctx, newTestUI(), cl, courses)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, c := range courses {
+		if c.attempts == 0 {
+			t.Errorf("%s never got a request while the others sat waiting on answers", c.id)
+		}
+	}
+	if len(arrived) < len(courses) {
+		t.Errorf("the portal saw %d requests in one timeout, want at least %d", len(arrived), len(courses))
+	}
+}
+
+// TestRejectionOnlyGivesUpItsOwnClaimOnTheClock guards the other half of
+// pacing from the last accepted request. A 429 rolls back the optimistic claim
+// the rejected request made on the clock, and nothing else's. When the edge is
+// slow to reject, which is exactly what a contested window does, another
+// request has already left by the time the rejection lands, and that one is
+// still presumed counted. Rolling the clock all the way back to the last
+// confirmed acceptance fires the next request inside the gap and buys a
+// second rejection.
+func TestRejectionOnlyGivesUpItsOwnClaimOnTheClock(t *testing.T) {
+	const gap = 600 * time.Millisecond
+
+	var (
+		mu       sync.Mutex
+		arrivals []time.Time
+		n        int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body regRequest
+		json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		n++
+		which := n
+		mu.Unlock()
+
+		switch which {
+		case 1:
+			// Rejected, but slowly, so the next request leaves first.
+			time.Sleep(gap + 100*time.Millisecond)
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, "<html>429</html>")
+		case 2:
+			// Accepted, and still outstanding when the rejection lands, so
+			// the scheduler has only its own send time to go on.
+			time.Sleep(3 * gap)
+			json.NewEncoder(w).Encode(regResponse{Time: time.Now().UnixMilli()})
+		default:
+			json.NewEncoder(w).Encode(regResponse{Time: time.Now().UnixMilli()})
+		}
+	}))
+	defer srv.Close()
+
+	defer swap(&regEndpoint, srv.URL)()
+	defer swap(&globalGap, gap)()
+	defer swap(&maxInflight, 0)()
+
+	cl := &client{http: &http.Client{Timeout: 5 * time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*gap)
+	defer cancel()
+
+	fireWindow(ctx, newTestUI(), cl, mkCourses("a", "b"))
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, a := range arrivals {
+		t.Logf("arrival %d at +%s", i+1, a.Sub(arrivals[0]).Truncate(time.Millisecond))
+	}
+	if len(arrivals) < 3 {
+		t.Fatalf("got %d requests, want at least 3", len(arrivals))
+	}
+	// The second request was never rejected, so it still holds the clock.
+	// The third is due a gap after it, not a poll after the first request's
+	// rejection.
+	if since := arrivals[2].Sub(arrivals[1]); since < gap-100*time.Millisecond {
+		t.Errorf("third request went out %s after the second, want about %s: the rejection rolled back a claim that was not its own", since, gap)
+	}
+}
+
+// TestFireWindowDoesNotSleepThroughAFastRetry is the other half of pacing from
+// the last accepted request. The scheduler sleeps toward the token it reserved
+// when it sent, and an answer landing meanwhile can bring that token forward:
+// a 429 was never counted, so the next request is due a poll later rather than
+// a whole gap. Sleeping blind through the rejection throws that away and hands
+// back the fixed backoff the measurement was meant to remove.
+func TestFireWindowDoesNotSleepThroughAFastRetry(t *testing.T) {
+	const gap = 800 * time.Millisecond
+
+	var (
+		mu       sync.Mutex
+		arrivals []time.Time
+		n        int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		n++
+		first := n == 1
+		mu.Unlock()
+
+		if first {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, "<html>429</html>")
+			return
+		}
+		json.NewEncoder(w).Encode(regResponse{
+			Jobs: []job{{CourseID: "a", Result: resultOK}}, Time: time.Now().UnixMilli(),
+		})
+	}))
+	defer srv.Close()
+
+	defer swap(&regEndpoint, srv.URL)()
+	defer swap(&globalGap, gap)()
+	defer swap(&maxInflight, 0)()
+
+	cl := &client{http: &http.Client{Timeout: 2 * time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*gap)
+	defer cancel()
+
+	fireWindow(ctx, newTestUI(), cl, mkCourses("a"))
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(arrivals) < 2 {
+		t.Fatalf("got %d requests, want the rejected one and its retry", len(arrivals))
+	}
+	// Nothing had been accepted, so the retry is due as soon as the poll
+	// delay is up, nowhere near a full gap later.
+	if since := arrivals[1].Sub(arrivals[0]); since > gap/2 {
+		t.Errorf("retried %s after the rejection, want about %s: the scheduler slept through it", since, rejectRetry)
+	}
+}
