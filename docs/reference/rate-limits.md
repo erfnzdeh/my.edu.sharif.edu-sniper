@@ -54,9 +54,11 @@ Run B also took a second `429` at 08:00:35, a full 5 seconds after its previous
 request and in the same millisecond as the answer to it. Nothing the sniper
 sent explains that, and it is the one observation no per client model covers. The limiter is keyed on the IP, so the traffic came from
 alongside it: a click in the browser, or another student behind the same NAT.
-The scheduler now treats a `429` as a 2 second hold on the shared token with
-the course keeping its place, which is the right response either way, but a
-browser tab on the portal during the window is a cost you can avoid.
+The scheduler now treats a `429` as evidence that the rejected request was
+never counted: the course keeps its place, and the next request is due a token
+after whatever the edge last accepted rather than a fixed wait after the
+rejection. That is the right response either way, but a browser tab on the
+portal during the window is a cost you can avoid.
 
 Both runs also got `REPEATED_REQUEST` on a course that then landed from a job
 the sniper had not knowingly queued. The job ids sit where a request sent a
