@@ -266,8 +266,19 @@ with `INCORRECT_UNIT_NUMBER`, so hardcoding a value is not safe. On one real
 ten course list, five courses were not three units and one was zero, so a
 hardcoded `3` would have failed half the list.
 
-The catalogue also means a wrong course code is caught while you are typing it
-rather than at the window.
+The catalogue is a snapshot, though, and departments add groups during the
+term, sometimes during a window. So it informs rather than gates:
+
+- A group the catalogue lacks, such as `37127-5` when the dump only has groups
+  1 to 3, takes the units and title of the code's other groups, with a warning.
+  Groups of one code have always agreed on both.
+- A code with no groups in the catalogue at all needs its units spelled out,
+  `99999-1:3`, and is then sent exactly as typed.
+- A course the catalogue does have is still range checked, so a wrong unit
+  count is caught while you are typing it rather than at the window.
+
+A code and group that do not exist at all come back from the portal as
+`INVALID_COURSE` at the window, so check anything the sniper warns about.
 
 ---
 
@@ -315,7 +326,7 @@ curl https://erfnzdeh.github.io/my.edu.sharif.edu-sniper/api/courses.json
 | Flag | Meaning |
 | --- | --- |
 | `-token` | Authorization header value. Also read from `MYEDU_TOKEN`. |
-| `-courses` | Comma separated, in priority order, for example `40404-1,22034-2:1`. |
+| `-courses` | Comma separated, in priority order, for example `40404-1,22034-2:1`. Groups newer than the catalogue are accepted. |
 | `-at` | Window time as `HH:MM`. Required with `-y` when `registrationTime` is stale. |
 | `-y` | Skip the confirmation prompt. Needs `-token` and `-courses`. |
 | `-catalogue` | Path or URL of `courses.json`. |
