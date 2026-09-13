@@ -1,5 +1,4 @@
 name: pages
-run-name: "Pages: ${{ github.event.head_commit.message || 'manual deploy' }}"
 
 on:
   push:
