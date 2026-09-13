@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -731,5 +732,74 @@ func TestFireWindowDoesNotSleepThroughAFastRetry(t *testing.T) {
 	// delay is up, nowhere near a full gap later.
 	if since := arrivals[1].Sub(arrivals[0]); since > gap/2 {
 		t.Errorf("retried %s after the rejection, want about %s: the scheduler slept through it", since, rejectRetry)
+	}
+}
+
+func testCatalogue() map[string]catalogueEntry {
+	return map[string]catalogueEntry{
+		"37127-1": {Units: 2, Title: "آیین زندگی", Capacity: 40},
+		"37127-2": {Units: 2, Title: "آیین زندگی", Capacity: 40},
+		"37127-3": {Units: 2, Title: "آیین زندگی", Capacity: 40},
+		"40760-1": {Units: 3, Variable: 1, Title: "variable"},
+		"22TA0-1": {Units: 0, Title: "ta"},
+		"50001-1": {Units: 3, Title: "split"},
+		"50001-2": {Units: 4, Title: "split"},
+	}
+}
+
+func TestParseCoursesTakesAGroupNewerThanTheCatalogue(t *testing.T) {
+	// 37127-5 was added during the term. The catalogue only knows groups 1 to
+	// 3, which all take two units, so the new group borrows that.
+	courses, warns, err := parseCourses(testCatalogue(), []string{"37127-5"})
+	if err != nil {
+		t.Fatalf("err = %v, want the new group accepted", err)
+	}
+	if c := courses[0]; c.id != "37127-5" || c.units != 2 || c.title != "آیین زندگی" {
+		t.Fatalf("course = %+v, want 37127-5 with 2 units and the sibling title", *c)
+	}
+	if len(warns) != 1 {
+		t.Fatalf("warns = %q, want one saying it is not in the catalogue", warns)
+	}
+}
+
+func TestParseCoursesChecksANewGroupsUnitsAgainstItsSiblings(t *testing.T) {
+	if _, _, err := parseCourses(testCatalogue(), []string{"37127-5:3"}); err == nil {
+		t.Fatal("37127-5:3 accepted, want the fixed two units of its siblings enforced")
+	}
+	courses, _, err := parseCourses(testCatalogue(), []string{"37127-5:2"})
+	if err != nil || courses[0].units != 2 {
+		t.Fatalf("37127-5:2 = %v, %v, want 2 units", courses, err)
+	}
+}
+
+func TestParseCoursesNeedsUnitsWhenNothingCanBeBorrowed(t *testing.T) {
+	cat := testCatalogue()
+	for _, spec := range []string{"99999-1", "50001-3"} {
+		if _, _, err := parseCourses(cat, []string{spec}); err == nil {
+			t.Fatalf("%s accepted with no units, want an error asking for them", spec)
+		}
+	}
+	courses, warns, err := parseCourses(cat, []string{"99999-1:3", "50001-3:4"})
+	if err != nil {
+		t.Fatalf("err = %v, want both sent as typed", err)
+	}
+	if courses[0].units != 3 || courses[1].units != 4 || len(warns) != 2 {
+		t.Fatalf("courses = %+v %+v, warns = %q", *courses[0], *courses[1], warns)
+	}
+}
+
+func TestParseCoursesKeepsTheCatalogueForKnownCourses(t *testing.T) {
+	cat := testCatalogue()
+	courses, warns, err := parseCourses(cat, []string{"37127-1", "40760-1:1", "22TA0-1"})
+	if err != nil || len(warns) != 0 {
+		t.Fatalf("err = %v, warns = %q, want a clean parse", err, warns)
+	}
+	if courses[0].units != 2 || courses[1].units != 1 || courses[2].units != 0 {
+		t.Fatalf("units = %d %d %d, want 2 1 0", courses[0].units, courses[1].units, courses[2].units)
+	}
+	for _, bad := range []string{"37127-1:3", "40760-1:4", "37127-1,37127-1", "37127", "37127-", "-5", "37127 5", "37127-5-1"} {
+		if _, _, err := parseCourses(cat, strings.Split(bad, ",")); err == nil {
+			t.Fatalf("%q accepted, want an error", bad)
+		}
 	}
 }

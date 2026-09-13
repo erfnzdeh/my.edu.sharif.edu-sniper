@@ -1371,7 +1371,11 @@ func mask(s string) string {
 
 func resolveCourses(ui *ui, cat map[string]catalogueEntry, spec string, yes bool) ([]*course, error) {
 	if spec != "" {
-		return parseCourses(cat, strings.Split(spec, ","))
+		courses, warns, err := parseCourses(cat, strings.Split(spec, ","))
+		for _, w := range warns {
+			ui.warn("courses    %s", w)
+		}
+		return courses, err
 	}
 	if yes {
 		return nil, errors.New("-y needs a course list, pass -courses")
@@ -1379,6 +1383,7 @@ func resolveCourses(ui *ui, cat map[string]catalogueEntry, spec string, yes bool
 	ui.rule("courses, most contested first")
 	ui.plain("  One per line as CODE-GROUP, for example 22034-2.")
 	ui.plain("  Units come from the catalogue. Append :N to override, for example 40760-1:2.")
+	ui.plain("  A group newer than the catalogue is fine, it takes the units of its other groups.")
 	ui.plain("  Order is priority: the first course gets the first request at the window.")
 	ui.plain("  Press Enter on an empty line when the list is complete.")
 	for {
@@ -1388,25 +1393,40 @@ func resolveCourses(ui *ui, cat map[string]catalogueEntry, spec string, yes bool
 			if line == "" {
 				break
 			}
-			one, err := parseCourses(cat, []string{line})
+			one, warns, err := parseCourses(cat, []string{line})
 			if err != nil {
 				ui.warn("      %v", err)
 				continue
 			}
+			for _, w := range warns {
+				ui.warn("      %s", w)
+			}
 			c := one[0]
-			ui.good("      %s  %s  %s, capacity %d", c.id, c.title, plural(int(c.units), "unit"), cat[c.id].Capacity)
+			if e, ok := cat[c.id]; ok {
+				ui.good("      %s  %s  %s, capacity %d", c.id, c.title, plural(int(c.units), "unit"), e.Capacity)
+			} else {
+				ui.good("      %s  %s  %s", c.id, c.title, plural(int(c.units), "unit"))
+			}
 			raw = append(raw, line)
 		}
 		if len(raw) == 0 {
 			ui.warn("  the list is empty, add at least one course")
 			continue
 		}
-		return parseCourses(cat, raw)
+		// Every line was already parsed and warned about on its own.
+		courses, _, err := parseCourses(cat, raw)
+		return courses, err
 	}
 }
 
-func parseCourses(cat map[string]catalogueEntry, specs []string) ([]*course, error) {
+// parseCourses turns CODE-GROUP[:N] specs into courses. The catalogue is a
+// snapshot, and departments add groups during the term, even during a window.
+// So a group the catalogue lacks is not an error: it borrows units and title
+// from the other groups of the same code, and a code with no groups at all is
+// sent as typed once you give its units. Each of those comes back as a warning.
+func parseCourses(cat map[string]catalogueEntry, specs []string) ([]*course, []string, error) {
 	var out []*course
+	var warns []string
 	seen := map[string]bool{}
 	for _, s := range specs {
 		s = strings.TrimSpace(s)
@@ -1419,35 +1439,82 @@ func parseCourses(cat map[string]catalogueEntry, specs []string) ([]*course, err
 			id = strings.TrimSpace(s[:i])
 			n, err := strconv.Atoi(strings.TrimSpace(s[i+1:]))
 			if err != nil || n < 0 {
-				return nil, fmt.Errorf("%q: units override must be a number", s)
+				return nil, nil, fmt.Errorf("%q: units override must be a number", s)
 			}
 			override = int32(n)
 		}
-		entry, ok := cat[id]
-		if !ok {
-			return nil, fmt.Errorf("%q is not in the catalogue, check the code and group", id)
+		if !validCourseID(id) {
+			return nil, nil, fmt.Errorf("%q is not CODE-GROUP, for example 22034-2", id)
 		}
 		if seen[id] {
-			return nil, fmt.Errorf("%q is listed twice", id)
+			return nil, nil, fmt.Errorf("%q is listed twice", id)
 		}
 		seen[id] = true
+
+		entry, ok := cat[id]
+		if !ok {
+			code, _, _ := strings.Cut(id, "-")
+			sib, groups, agree := siblingEntry(cat, code)
+			switch {
+			case groups > 0 && agree:
+				entry = sib
+				warns = append(warns, fmt.Sprintf("%s is not in the catalogue, likely a group added since the dump, using %s from its %s",
+					id, plural(int(entry.Units), "unit"), plural(groups, "other group")))
+			case override < 0 && groups > 0:
+				return nil, nil, fmt.Errorf("%q is not in the catalogue and the groups of %s disagree on units, append them, for example %s:3", id, code, id)
+			case override < 0:
+				return nil, nil, fmt.Errorf("%q is not in the catalogue and neither is any group of %s, append its units to send it anyway, for example %s:3", id, code, id)
+			default:
+				warns = append(warns, fmt.Sprintf("%s is not in the catalogue, sending it as typed with %s", id, plural(int(override), "unit")))
+				out = append(out, &course{id: id, units: override, pri: len(out)})
+				continue
+			}
+		}
 
 		units := entry.Units
 		if override >= 0 {
 			if !entry.variableUnits() && override != entry.Units {
-				return nil, fmt.Errorf("%s takes exactly %s and is not variable", id, plural(int(entry.Units), "unit"))
+				return nil, nil, fmt.Errorf("%s takes exactly %s and is not variable", id, plural(int(entry.Units), "unit"))
 			}
 			if override > entry.Units {
-				return nil, fmt.Errorf("%s allows at most %s", id, plural(int(entry.Units), "unit"))
+				return nil, nil, fmt.Errorf("%s allows at most %s", id, plural(int(entry.Units), "unit"))
 			}
 			units = override
 		}
 		out = append(out, &course{id: id, units: units, title: entry.Title, pri: len(out)})
 	}
 	if len(out) == 0 {
-		return nil, errors.New("no courses given")
+		return nil, nil, errors.New("no courses given")
 	}
-	return out, nil
+	return out, warns, nil
+}
+
+// siblingEntry describes a course code from the groups the catalogue does
+// have. Groups of one code have always agreed on units, variability and
+// title, but if they ever do not, agree is false and nothing is borrowed.
+func siblingEntry(cat map[string]catalogueEntry, code string) (entry catalogueEntry, groups int, agree bool) {
+	agree = true
+	for id, e := range cat {
+		if c, _, _ := strings.Cut(id, "-"); c != code {
+			continue
+		}
+		if groups == 0 {
+			entry = e
+		} else if e.Units != entry.Units || e.variableUnits() != entry.variableUnits() || e.Title != entry.Title {
+			agree = false
+		}
+		groups++
+	}
+	entry.Capacity = 0 // a sibling's capacity says nothing about this group
+	return entry, groups, agree
+}
+
+// validCourseID checks only the CODE-GROUP shape. Codes are not all digits,
+// the catalogue has 22TA0-1, so anything past the shape is the portal's call.
+func validCourseID(id string) bool {
+	code, group, ok := strings.Cut(id, "-")
+	return ok && code != "" && group != "" &&
+		!strings.ContainsAny(id, " \t,:") && !strings.Contains(group, "-")
 }
 
 func confirm(ui *ui, courses []*course, s *clockSync, target, fireAt time.Time, yes bool) bool {
